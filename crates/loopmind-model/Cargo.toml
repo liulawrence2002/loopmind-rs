@@ -1,0 +1,21 @@
+[package]
+name = "loopmind-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "LoopMind architecture, parameter census, and the Burn framework boundary."
+
+[dependencies]
+burn = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+
+[features]
+default = []
+# Portable GPU backend. Off in CI.
+wgpu = ["burn/wgpu"]
+# NVIDIA backend for the RTX 4070 Laptop dev box. Off in CI.
+cuda = ["burn/cuda"]

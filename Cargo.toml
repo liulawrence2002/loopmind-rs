@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/loopmind",
+    "crates/loopmind-data",
+    "crates/loopmind-model",
+    "crates/loopmind-tokenizer",
+    "crates/loopmind-train",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["liulawrence2002"]
+repository = "https://github.com/liulawrence2002/loopmind-rs"
+rust-version = "1.95"
+
+[workspace.dependencies]
+burn = { version = "0.22.1", default-features = false, features = ["std", "flex"] }
+clap = { version = "4.5", features = ["derive", "cargo"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+loopmind-data = { path = "crates/loopmind-data" }
+loopmind-model = { path = "crates/loopmind-model" }
+loopmind-tokenizer = { path = "crates/loopmind-tokenizer" }
+loopmind-train = { path = "crates/loopmind-train" }
