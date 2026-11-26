@@ -179,6 +179,10 @@ fn render(config: &LoopMindConfig, params: &ParamBreakdown) -> String {
             config.loop_count_mean, config.loop_count_max, config.bptt_passes
         ),
     );
+    line(
+        &mut out,
+        format_args!("aux loss coef: {}", config.aux_loss_coef),
+    );
     line(&mut out, format_args!(""));
 
     let embed_label = if config.tie_embeddings {

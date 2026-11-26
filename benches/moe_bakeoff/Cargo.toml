@@ -1,0 +1,20 @@
+[package]
+name = "moe-bakeoff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "CPU forward+backward timing of one LoopMind MoE layer in Burn and Candle."
+publish = false
+
+[dependencies]
+burn = { workspace = true }
+candle-core = "0.9"
+loopmind-model = { workspace = true }
+
+[features]
+default = []
+# NVIDIA GPU. Requires the CUDA toolkit. See docs/framework-decision.md.
+cuda = ["burn/cuda", "candle-core/cuda"]

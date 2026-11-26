@@ -4,7 +4,7 @@
 
 LoopMind is a tiny English-first language model trained end to end in Rust. The pipeline follows [MiniMind](https://github.com/jingyaogong/minimind): train a tokenizer, pretrain, supervised-finetune, then chat. The network is a Huginn-style recurrent-depth transformer whose shared core is a fine-grained mixture of experts.
 
-This repository is the M0 scaffold. It has the workspace, the architecture config, the parameter census, and CI. It does not train yet.
+M0 is the workspace, config, parameter census, and CI. M1 is the Burn forward pass, gradient checks, a PyTorch parity test, and a one-layer Burn vs Candle timing check. The pretrain loop is still M4.
 
 The training pipeline is inspired by Jingyao Gong's [MiniMind](https://github.com/jingyaogong/minimind). The recurrence follows Huginn ([Geiping et al., 2025](https://arxiv.org/abs/2502.05171)): a prelude, a core that loops at train time and at inference time, and a coda. The wide, sparse expert layers follow MoEUT (Csordás et al., NeurIPS 2024; [code](https://github.com/RobertCsordas/moeut)). LoopMind uses ordinary grouped-query attention and SwiGLU experts. MoEUT routes attention as well, and its experts are ReLU.
 
@@ -35,7 +35,7 @@ Each layer is RMSNorm, attention, residual, RMSNorm, SwiGLU, residual. A final R
 
 Dense width 768 is the usual SwiGLU size: two-thirds of `4 * d_model` (682), rounded up to a multiple of 256. The checked-in file is [`configs/default.toml`](configs/default.toml).
 
-Training draws a loop count `r` per sequence with mean 4 and maximum 16, and backpropagates through the last 4 passes only. The core weights are shared, so `r` does not change the checkpoint size. At inference, `r` is a dial. Huginn re-injects the prelude embedding on every pass and starts from a random latent state; that recurrence is part of the M1 forward pass. Residual re-injection adds no parameters. There is no learned concat adapter in this census.
+Training draws a loop count `r` per sequence from a Poisson with mean 4, clamped to 1..=16, and backpropagates through the last 4 passes only. Earlier passes are detached. The core weights are shared, so `r` does not change the checkpoint size. At inference, `r` is a dial. Each pass adds the prelude state back onto the core output (`s = Core(s) + e`, starting from `s = e`). That residual add has no parameters. There is no learned concat adapter. Sampled training runs one sequence at a time so each row can have its own `r`.
 
 ## Parameter count
 
@@ -101,12 +101,28 @@ cargo test --workspace
 
 `tokenize-train`, `pretrain`, `sft`, and `chat` are stubs. Each prints the milestone that will implement it and exits 0. `pretrain` and `sft` also print the data plan.
 
+PyTorch parity, after the Rust test has written `target/parity`:
+
+```bash
+cargo test -p loopmind-model export_parity_fixture -- --exact export_parity_fixture
+python python/reference.py target/parity
+```
+
+The reference uses Burn's linear layout (`y = x @ W` with `W` shaped `[d_in, d_out]`). The gate is absolute and relative tolerance `1e-5`. On the checked-in tiny config the largest logit gap is about `8e-7`.
+
+One MoE layer, forward and backward:
+
+```bash
+cargo run -p moe-bakeoff --release
+cargo run -p moe-bakeoff --release --features cuda   # RTX 4070 Laptop, needs the CUDA toolkit
+```
+
 ## Roadmap
 
 | Milestone | Work |
 | --- | --- |
-| M0 | Workspace, config, parameter census, CI. This scaffold. |
-| M1 | Forward pass, a gradient-coverage test, PyTorch parity on a tiny config, and a Burn vs Candle check. |
+| M0 | Workspace, config, parameter census, CI. Done. |
+| M1 | Forward pass, gradient-coverage test, PyTorch parity on a tiny config, and a Burn vs Candle check. Done. See [docs/framework-decision.md](docs/framework-decision.md). |
 | M2 | Train the 6400-vocab BPE. |
 | M3 | Data pipeline for the pretrain mix and the English SFT split. |
 | M4 | Pretrain loop: random `r` per sequence, truncated backprop through the last 4 passes. |

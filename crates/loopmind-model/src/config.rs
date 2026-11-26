@@ -100,6 +100,8 @@ pub struct LoopMindConfig {
     pub loop_count_max: usize,
     /// Truncated backprop depth, in loop passes.
     pub bptt_passes: usize,
+    /// Multiplier on the summed load-balancing loss. Not a parameter.
+    pub aux_loss_coef: f64,
 }
 
 impl Default for LoopMindConfig {
@@ -125,11 +127,27 @@ impl Default for LoopMindConfig {
             loop_count_mean: 4.0,
             loop_count_max: 16,
             bptt_passes: 4,
+            aux_loss_coef: 1e-2,
         }
     }
 }
 
 impl LoopMindConfig {
+    /// Small config for parity and gradient tests. Same block layout as [`Self::default`].
+    pub fn tiny() -> Self {
+        Self {
+            d_model: 64,
+            n_q_heads: 4,
+            n_kv_heads: 2,
+            vocab_size: 128,
+            context_length: 32,
+            dense_intermediate_size: 128,
+            n_experts: 4,
+            expert_intermediate_size: 32,
+            ..Self::default()
+        }
+    }
+
     /// Query/key/value head dimension. Valid after [`Self::validate`].
     pub fn head_dim(&self) -> usize {
         self.d_model / self.n_q_heads
@@ -190,6 +208,11 @@ impl LoopMindConfig {
         if self.bptt_passes == 0 || self.bptt_passes > self.loop_count_max {
             return Err(invalid("bptt_passes must be between 1 and loop_count_max"));
         }
+        if !(self.aux_loss_coef.is_finite() && self.aux_loss_coef >= 0.0) {
+            return Err(invalid(
+                "aux_loss_coef must be finite and greater than or equal to 0",
+            ));
+        }
         Ok(())
     }
 
@@ -221,6 +244,14 @@ mod tests {
         let loaded = LoopMindConfig::from_path(&path).unwrap();
         assert_eq!(loaded, LoopMindConfig::default());
         assert_eq!(loaded.head_dim(), 64);
+    }
+
+    #[test]
+    fn tiny_config_matches_checked_in_toml() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/tiny.toml");
+        let loaded = LoopMindConfig::from_path(&path).unwrap();
+        assert_eq!(loaded, LoopMindConfig::tiny());
+        assert_eq!(loaded.head_dim(), 16);
     }
 
     #[test]

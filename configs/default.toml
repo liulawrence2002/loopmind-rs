@@ -25,3 +25,4 @@ reroute_every_pass = true
 loop_count_mean = 4.0
 loop_count_max = 16
 bptt_passes = 4
+aux_loss_coef = 1e-2

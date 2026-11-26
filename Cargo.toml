@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "benches/moe_bakeoff",
     "crates/loopmind",
     "crates/loopmind-data",
     "crates/loopmind-model",
@@ -17,7 +18,7 @@ repository = "https://github.com/liulawrence2002/loopmind-rs"
 rust-version = "1.95"
 
 [workspace.dependencies]
-burn = { version = "0.22.1", default-features = false, features = ["std", "flex"] }
+burn = { version = "0.22.1", default-features = false, features = ["std", "flex", "autodiff"] }
 clap = { version = "4.5", features = ["derive", "cargo"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
