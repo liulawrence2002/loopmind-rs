@@ -1,1 +1,130 @@
 # loopmind-rs
+
+[![CI](https://github.com/liulawrence2002/loopmind-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/liulawrence2002/loopmind-rs/actions/workflows/ci.yml)
+
+LoopMind is a tiny English-first language model trained end to end in Rust. The pipeline follows [MiniMind](https://github.com/jingyaogong/minimind): train a tokenizer, pretrain, supervised-finetune, then chat. The network is a Huginn-style recurrent-depth transformer whose shared core is a fine-grained mixture of experts.
+
+This repository is the M0 scaffold. It has the workspace, the architecture config, the parameter census, and CI. It does not train yet.
+
+The training pipeline is inspired by Jingyao Gong's [MiniMind](https://github.com/jingyaogong/minimind). The recurrence follows Huginn ([Geiping et al., 2025](https://arxiv.org/abs/2502.05171)): a prelude, a core that loops at train time and at inference time, and a coda. The wide, sparse expert layers follow MoEUT (Csordás et al., NeurIPS 2024; [code](https://github.com/RobertCsordas/moeut)). LoopMind uses ordinary grouped-query attention and SwiGLU experts. MoEUT routes attention as well, and its experts are ReLU.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    tokens["Token ids"] --> embed["Tied embedding"]
+    embed --> prelude["Prelude: 1 dense layer"]
+    prelude --> state["Latent state"]
+    state --> core1["Core MoE layer 1"]
+    core1 --> core2["Core MoE layer 2"]
+    core2 -->|"next pass, new top-2 routing"| state
+    core2 --> coda["Coda: 1 dense layer"]
+    coda --> fnorm["Final RMSNorm"]
+    fnorm --> logits["Logits, tied head"]
+```
+
+One unique stack is four pre-norm transformer layers:
+
+| Stage | Layers | Feed-forward |
+| --- | --- | --- |
+| Prelude | 1 | Dense SwiGLU, intermediate 768 |
+| Core | 2, shared across the loop | 32 SwiGLU experts of width 128, top-2, routed again every pass |
+| Coda | 1 | Dense SwiGLU, intermediate 768 |
+
+Each layer is RMSNorm, attention, residual, RMSNorm, SwiGLU, residual. A final RMSNorm sits in front of the tied output head. Attention is grouped-query: `d_model` 256, 4 query heads, 2 key/value heads, head dim 64, RoPE θ = 1e6, no biases. RMSNorm ε = 1e-6. Vocabulary 6400, context 1024. Embeddings are tied with the output head, so that matrix is stored once.
+
+Dense width 768 is the usual SwiGLU size: two-thirds of `4 * d_model` (682), rounded up to a multiple of 256. The checked-in file is [`configs/default.toml`](configs/default.toml).
+
+Training draws a loop count `r` per sequence with mean 4 and maximum 16, and backpropagates through the last 4 passes only. The core weights are shared, so `r` does not change the checkpoint size. At inference, `r` is a dial. Huginn re-injects the prelude embedding on every pass and starts from a random latent state; that recurrence is part of the M1 forward pass. Residual re-injection adds no parameters. There is no learned concat adapter in this census.
+
+## Parameter count
+
+`cargo run -p loopmind -- params` prints this census. Counts come from the config arithmetic in `loopmind-model` (bias-free linears, SwiGLU = three matrices, router = `d_model * n_experts`, core stored once).
+
+| Component | Params |
+| --- | ---: |
+| Embeddings, tied with the head | 1,638,400 |
+| Attention, 4 layers | 786,432 |
+| RMSNorm, 2 per layer plus final | 2,304 |
+| Dense SwiGLU, 2 layers × 768 | 1,179,648 |
+| Routers, 2 layers × 32 | 16,384 |
+| Experts, 2 layers × 32 × width 128 | 6,291,456 |
+| **Total** | **9,914,624** |
+| Active experts, top-2 | 393,216 |
+| **Active per token, excluding embeddings and head** | **2,377,984** |
+
+Active parameters are one pass over the unique layers with only the top-2 experts per core layer. Inactive experts (5,898,240) stay in the checkpoint and out of the active count. Running the core `r` times multiplies FLOPs, not parameters.
+
+The M0 brief quoted ~9,654,016 total and ~2,117,376 active. Those two numbers are internally consistent with this embedding matrix and this MoE (the gap between them is exactly the tied embedding plus the inactive experts). They are not consistent with an integer dense SwiGLU width under the pre-norm block above: hitting them would take a dense intermediate size of about 598. The census uses 768, and both totals are higher by the same 260,608 parameters. The unit test asserts 9,914,624 and 2,377,984.
+
+## Data
+
+English first. The M2 tokenizer is an owned 6400-vocab BPE (`tokenizers` crate).
+
+Pretrain, 50M tokens ([`loopmind-data`](crates/loopmind-data)):
+
+| Slice | Tokens |
+| --- | ---: |
+| FineWeb-Edu sample-10BT | 25M |
+| Cosmopedia-v2 (SmolLM corpus) | 10M |
+| TinyStories | 10M |
+| English Wikipedia rows from `KeremTT/FABLE-5.2-MAX-DATABASE`, column `raw_text_corpus` | 5M |
+
+SFT uses English chat rows of `KeremTT/FABLE-5.2-MAX-DATABASE`. Rows over 1024 tokens are dropped, Turkish rows are dropped, and 2,000 checkable rows are held out for eval. DPO is later and out of scope.
+
+## Crates
+
+| Crate | Role |
+| --- | --- |
+| `loopmind-model` | Config, parameter census, and Burn. The only crate allowed to depend on a tensor framework. |
+| `loopmind-tokenizer` | BPE target (M2). |
+| `loopmind-data` | Pretrain mix and SFT rules (M3). |
+| `loopmind-train` | Pretrain and SFT drivers (M4, M5). Depends on the model crate, not on Burn. |
+| `loopmind` | `clap` CLI. |
+
+Burn 0.22.1 is the framework. The default build enables the pure-Rust `flex` CPU backend, which is what CI runs. `wgpu` and `cuda` are feature flags on `loopmind` and `loopmind-model`:
+
+```bash
+cargo run -p loopmind --features cuda -- params
+cargo run -p loopmind --features wgpu -- params
+```
+
+M1 compares Burn with Candle. That comparison stays inside `loopmind-model`.
+
+## Commands
+
+```bash
+cargo run -p loopmind -- params
+cargo run -p loopmind -- params --config configs/default.toml
+cargo test --workspace
+```
+
+`tokenize-train`, `pretrain`, `sft`, and `chat` are stubs. Each prints the milestone that will implement it and exits 0. `pretrain` and `sft` also print the data plan.
+
+## Roadmap
+
+| Milestone | Work |
+| --- | --- |
+| M0 | Workspace, config, parameter census, CI. This scaffold. |
+| M1 | Forward pass, a gradient-coverage test, PyTorch parity on a tiny config, and a Burn vs Candle check. |
+| M2 | Train the 6400-vocab BPE. |
+| M3 | Data pipeline for the pretrain mix and the English SFT split. |
+| M4 | Pretrain loop: random `r` per sequence, truncated backprop through the last 4 passes. |
+| M5 | SFT and the chat CLI. |
+
+DPO comes after these milestones.
+
+## Hardware
+
+Development target is an NVIDIA GeForce RTX 4070 Laptop with 8 GB. Build that box with `--features cuda`. The model is about 10M parameters with a 1024-token context, which is the size aimed at that card. M4 still has to budget activation memory for the four backprop passes through the core.
+
+`wgpu` is the portable GPU feature for machines without CUDA. CI is CPU-only and uses Burn's `flex` backend. The toolchain is stable Rust (`rust-toolchain.toml`); Burn 0.22 sets the minimum at 1.95.
+
+## License
+
+Licensed under either of
+
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+
+at your option.

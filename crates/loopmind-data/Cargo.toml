@@ -1,0 +1,9 @@
+[package]
+name = "loopmind-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "LoopMind pretrain mix and SFT selection rules. Loaders land in M3."
