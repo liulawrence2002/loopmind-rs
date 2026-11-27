@@ -26,6 +26,33 @@ pub struct SftBatch {
     pub seq_len: usize,
 }
 
+impl SftBatch {
+    /// One row padded with `pad_id` to a multiple of `pad_multiple`. Padding has mask 0.
+    pub fn from_row(row: &SftRow, pad_id: u16, pad_multiple: usize) -> Self {
+        let multiple = pad_multiple.max(1);
+        let width = row.tokens.len().div_ceil(multiple).max(1) * multiple;
+        let mut tokens = vec![pad_id; width];
+        let mut mask = vec![0u8; width];
+        tokens[..row.tokens.len()].copy_from_slice(&row.tokens);
+        mask[..row.mask.len()].copy_from_slice(&row.mask);
+        Self {
+            tokens,
+            mask,
+            batch: 1,
+            seq_len: width,
+        }
+    }
+
+    /// Next-token targets that are trained: mask 1 at positions `1..seq_len` of each row.
+    /// Position 0 has no prefix, so it is never a target.
+    pub fn supervised_targets(&self) -> u64 {
+        self.mask
+            .chunks(self.seq_len.max(1))
+            .map(|row| row.iter().skip(1).filter(|bit| **bit != 0).count() as u64)
+            .sum()
+    }
+}
+
 struct ShardLoc {
     path: std::path::PathBuf,
     sequences: u32,
@@ -204,6 +231,8 @@ pub struct SftLoader {
     buckets: [Vec<usize>; 5],
     pad_id: u16,
     rng: Rng,
+    order_key: Option<(u64, u64)>,
+    order: Vec<u32>,
 }
 
 impl SftLoader {
@@ -233,7 +262,38 @@ impl SftLoader {
             buckets,
             pad_id,
             rng: Rng::new(seed),
+            order_key: None,
+            order: Vec::new(),
         })
+    }
+
+    /// Next row of a seeded epoch shuffle, padded to a multiple of `pad_multiple`.
+    ///
+    /// Every row is visited once per epoch. Training runs one row at a time because
+    /// each row draws its own loop count, so rows are not packed into a shared width.
+    pub fn next_row(
+        &mut self,
+        cursor: &mut EpochCursor,
+        pad_multiple: usize,
+    ) -> Result<SftBatch, DataError> {
+        if self.rows.is_empty() {
+            return Err(DataError::new("sft loader is empty"));
+        }
+        let key = (cursor.seed, cursor.epoch);
+        if self.order_key != Some(key) {
+            let n = u32::try_from(self.rows.len())
+                .map_err(|_| DataError::new("too many sft rows for a u32 shuffle"))?;
+            self.order = permutation(n, mix_epoch(cursor.seed, cursor.epoch));
+            self.order_key = Some(key);
+        }
+        let row = &self.rows[self.order[cursor.index as usize] as usize];
+        let batch = SftBatch::from_row(row, self.pad_id, pad_multiple);
+        cursor.index += 1;
+        if cursor.index >= self.order.len() as u64 {
+            cursor.epoch += 1;
+            cursor.index = 0;
+        }
+        Ok(batch)
     }
 
     pub fn len(&self) -> usize {
@@ -275,6 +335,65 @@ impl SftLoader {
             seq_len: width,
         })
     }
+}
+
+/// One held-out SFT row from `sft/eval.jsonl`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SftEvalRow {
+    pub id: String,
+    pub config: String,
+    /// Text of the last assistant turn.
+    pub reference: String,
+    pub tokens: Vec<u16>,
+    pub loss_mask: Vec<u8>,
+}
+
+impl SftEvalRow {
+    pub fn row(&self) -> SftRow {
+        SftRow {
+            tokens: self.tokens.clone(),
+            mask: self.loss_mask.clone(),
+        }
+    }
+
+    /// Tokens before the final assistant answer, ending with that turn's generation prompt.
+    ///
+    /// An eval transcript ends `answer <|im_end|> \n <|eos|>` with mask `1.. 1 0 1`, so
+    /// walking back over the `<|eos|>` run, the newline, and the answer run lands on the
+    /// first answer token.
+    pub fn prompt(&self) -> &[u16] {
+        let mask = &self.loss_mask;
+        let mut index = mask.len();
+        for want in [1u8, 0, 1] {
+            while index > 0 && mask[index - 1] == want {
+                index -= 1;
+            }
+        }
+        &self.tokens[..index]
+    }
+}
+
+/// The first `limit` rows of `eval.jsonl`, in file order. `limit == 0` reads every row.
+pub fn read_sft_eval(path: &Path, limit: usize) -> Result<Vec<SftEvalRow>, DataError> {
+    let text = fs::read_to_string(path)?;
+    let mut rows = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        if limit > 0 && rows.len() >= limit {
+            break;
+        }
+        let row: SftEvalRow = serde_json::from_str(line)
+            .map_err(|error| DataError::new(format!("{}: {error}", path.display())))?;
+        if row.tokens.len() != row.loss_mask.len() {
+            return Err(DataError::new(format!(
+                "eval row {} has {} tokens and {} mask entries",
+                row.id,
+                row.tokens.len(),
+                row.loss_mask.len()
+            )));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 fn bucket_index(len: usize) -> usize {
@@ -375,6 +494,55 @@ mod tests {
         loader.next_batch(2, &mut cursor).unwrap();
         assert_eq!(cursor.epoch, 1);
         assert_eq!(cursor.index, 1);
+    }
+
+    #[test]
+    fn sft_epoch_visits_every_row_once_and_pads() {
+        let dir = std::env::temp_dir().join(format!("loopmind-sft-epoch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rows: Vec<SftRow> = (0..5u16)
+            .map(|row| SftRow {
+                tokens: vec![100 + row; 3 + row as usize],
+                mask: vec![1; 3 + row as usize],
+            })
+            .collect();
+        write_sft_shard(&dir.join("sft-00000.bin"), &rows).unwrap();
+        let mut loader = SftLoader::from_dir(&dir, 0, 3).unwrap();
+        let mut cursor = EpochCursor::new(8);
+        let mut firsts = Vec::new();
+        for _ in 0..5 {
+            let batch = loader.next_row(&mut cursor, 4).unwrap();
+            assert_eq!(batch.batch, 1);
+            assert_eq!(batch.seq_len % 4, 0);
+            let real = batch.tokens.iter().filter(|id| **id != 0).count();
+            assert_eq!(batch.supervised_targets(), real as u64 - 1);
+            firsts.push(batch.tokens[0]);
+        }
+        firsts.sort_unstable();
+        assert_eq!(firsts, vec![100, 101, 102, 103, 104]);
+        assert_eq!((cursor.epoch, cursor.index), (1, 0));
+        let mut again = SftLoader::from_dir(&dir, 0, 3).unwrap();
+        let mut restart = EpochCursor::new(8);
+        let mut replay = EpochCursor::new(8);
+        let mut first = SftLoader::from_dir(&dir, 0, 3).unwrap();
+        assert_eq!(
+            again.next_row(&mut restart, 4).unwrap().tokens,
+            first.next_row(&mut replay, 4).unwrap().tokens
+        );
+    }
+
+    #[test]
+    fn eval_prompt_stops_before_the_final_answer() {
+        let row = SftEvalRow {
+            id: "x".into(),
+            config: "math_reasoning".into(),
+            reference: "4".into(),
+            // bos, user turn, generation prompt, answer, im_end, newline, eos
+            tokens: vec![1, 10, 11, 12, 20, 21, 30, 31, 5, 9, 2],
+            loss_mask: vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1],
+        };
+        assert_eq!(row.prompt(), &[1, 10, 11, 12, 20, 21]);
     }
 
     #[test]

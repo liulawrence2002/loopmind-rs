@@ -4147,6 +4147,7 @@ version = "0.1.0"
 dependencies = [
  "loopmind-data",
  "loopmind-model",
+ "loopmind-tokenizer",
  "serde",
  "serde_json",
  "toml 0.8.23",

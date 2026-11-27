@@ -158,3 +158,40 @@ fn export_parity_fixture_writes_logits() {
     assert!(dir.join("logits_r3.f32").is_file());
     assert!(dir.join("embed.weight.f32").is_file());
 }
+
+#[test]
+fn fused_experts_match_the_per_expert_loop() {
+    let device = Device::flex().autodiff();
+    device.seed(5);
+    let config = LoopMindConfig::tiny();
+    let moe = crate::Mixture::new(&config, &device).train();
+    let values: Vec<f32> = (0..2 * 6 * config.d_model)
+        .map(|index| ((index * 37 % 101) as f32 / 50.0) - 1.0)
+        .collect();
+    let x = Tensor::<3>::from_data(TensorData::new(values, [2, 6, config.d_model]), &device);
+    let (fused, fused_aux, fused_slots) = moe.forward(x.clone(), None);
+    let (looped, looped_aux, looped_slots) = moe.forward_unfused(x, None);
+    assert!(max_abs_diff(&fused, &looped) < 1e-5);
+    assert!((scalar(&fused_aux) - scalar(&looped_aux)).abs() < 1e-6);
+    let fused_slots = fused_slots.into_data().try_into_vec::<f32>().unwrap();
+    assert_eq!(
+        fused_slots,
+        looped_slots.into_data().try_into_vec::<f32>().unwrap()
+    );
+    let fused_grads = fused.sum().backward();
+    let looped_grads = looped.sum().backward();
+    for expert in &moe.experts {
+        for weight in [&expert.gate.weight, &expert.up.weight, &expert.down.weight] {
+            let left = weight.val().grad(&fused_grads).expect("fused grad");
+            let right = weight.val().grad(&looped_grads).expect("looped grad");
+            let left = left.into_data().try_into_vec::<f32>().unwrap();
+            let right = right.into_data().try_into_vec::<f32>().unwrap();
+            let gap = left
+                .iter()
+                .zip(&right)
+                .map(|(lhs, rhs)| (lhs - rhs).abs())
+                .fold(0.0, f32::max);
+            assert!(gap < 1e-5, "expert weight gradient differs by {gap}");
+        }
+    }
+}

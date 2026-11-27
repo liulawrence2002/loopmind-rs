@@ -20,7 +20,7 @@ use burn::nn::{Embedding, EmbeddingConfig, Initializer, RmsNorm};
 use burn::tensor::{Int, Tensor, TensorData};
 use serde::Serialize;
 
-use crate::blocks::{rms_norm, DenseBlock, MoeBlock};
+use crate::blocks::{rms_norm, AttnContext, DenseBlock, FusedExperts, MoeBlock};
 use crate::config::LoopMindConfig;
 use crate::rng::TrainRng;
 
@@ -142,17 +142,22 @@ impl LoopMind {
         } else {
             usize::MAX
         };
+        let [batch, seq] = tokens.dims();
         let embedded = self.embed.forward(tokens);
-        let e = dense_stack(&self.prelude, embedded);
-        let (state, aux, expert_slots) = self.recur(e, loops, bptt, force_routes);
-        let hidden = self.final_norm.forward(dense_stack(&self.coda, state));
+        let ctx =
+            AttnContext::new(&self.config, batch, seq, &embedded.device()).cast(embedded.dtype());
+        let e = dense_stack(&self.prelude, embedded, &ctx);
+        let (state, aux, slot_sums) = self.recur(e, loops, bptt, force_routes, &ctx);
+        let hidden = self
+            .final_norm
+            .forward(dense_stack(&self.coda, state, &ctx));
         let logits = tied_logits(hidden, &self.embed);
         let aux_loss = aux.mul_scalar(self.config.aux_loss_coef);
         ForwardOutput {
             logits,
             aux_loss,
             loops: vec![loops],
-            expert_slots,
+            expert_slots: slots_to_host(slot_sums, loops),
         }
     }
 
@@ -162,17 +167,25 @@ impl LoopMind {
         loops: usize,
         bptt: usize,
         force_routes: Option<Tensor<3, Int>>,
-    ) -> (Tensor<3>, Tensor<1>, Vec<Vec<f32>>) {
+        ctx: &AttnContext,
+    ) -> (Tensor<3>, Tensor<1>, Vec<Tensor<1>>) {
+        // The core is shared across passes, so its expert weights are concatenated once.
+        let fused: Vec<FusedExperts> = self.core.iter().map(|layer| layer.moe.fuse()).collect();
         let mut state = e.clone();
         let mut aux: Option<Tensor<1>> = None;
-        let mut slot_sum: Vec<Vec<f32>> = Vec::new();
+        let mut slot_sum: Vec<Tensor<1>> = Vec::new();
         for pass in 0..loops {
-            let (core_out, pass_aux, pass_slots) = self.apply_core(state, force_routes.clone());
-            if slot_sum.is_empty() {
-                slot_sum = pass_slots;
+            let (core_out, pass_aux, pass_slots) =
+                self.apply_core(state, force_routes.clone(), ctx, &fused);
+            slot_sum = if slot_sum.is_empty() {
+                pass_slots
             } else {
-                add_slots(&mut slot_sum, &pass_slots);
-            }
+                slot_sum
+                    .into_iter()
+                    .zip(pass_slots)
+                    .map(|(sum, next)| sum + next)
+                    .collect()
+            };
             let updated = core_out + e.clone();
             let early = pass.saturating_add(bptt) < loops;
             if early {
@@ -183,7 +196,6 @@ impl LoopMind {
                 aux = Some(add_aux(aux, pass_aux));
             }
         }
-        scale_slots(&mut slot_sum, 1.0 / loops as f32);
         let aux = aux.unwrap_or_else(|| Tensor::<1>::zeros([1], &state.device()));
         (state, aux, slot_sum)
     }
@@ -192,14 +204,17 @@ impl LoopMind {
         &self,
         mut hidden: Tensor<3>,
         force_routes: Option<Tensor<3, Int>>,
-    ) -> (Tensor<3>, Tensor<1>, Vec<Vec<f32>>) {
+        ctx: &AttnContext,
+        fused: &[FusedExperts],
+    ) -> (Tensor<3>, Tensor<1>, Vec<Tensor<1>>) {
         let mut aux: Option<Tensor<1>> = None;
         let mut slots = Vec::with_capacity(self.core.len());
-        for layer in &self.core {
-            let (next, layer_aux, layer_slots) = layer.forward(hidden, force_routes.clone());
+        for (layer, weights) in self.core.iter().zip(fused) {
+            let (next, layer_aux, layer_slots) =
+                layer.forward(hidden, force_routes.clone(), ctx, weights);
             hidden = next;
             aux = Some(add_aux(aux, layer_aux));
-            slots.push(vector_f32(layer_slots.detach()));
+            slots.push(layer_slots.detach());
         }
         let aux = aux.unwrap_or_else(|| Tensor::<1>::zeros([1], &hidden.device()));
         (hidden, aux, slots)
@@ -294,9 +309,9 @@ impl LoopMind {
     }
 }
 
-fn dense_stack(layers: &[DenseBlock], mut hidden: Tensor<3>) -> Tensor<3> {
+fn dense_stack(layers: &[DenseBlock], mut hidden: Tensor<3>, ctx: &AttnContext) -> Tensor<3> {
     for layer in layers {
-        hidden = layer.forward(hidden);
+        hidden = layer.forward(hidden, ctx);
     }
     hidden
 }
@@ -326,12 +341,20 @@ fn scale_slots(slots: &mut [Vec<f32>], scale: f32) {
     }
 }
 
-fn vector_f32(tensor: Tensor<1>) -> Vec<f32> {
-    tensor
+/// Per-layer slot fractions averaged over passes, read back in one device sync.
+fn slots_to_host(sums: Vec<Tensor<1>>, loops: usize) -> Vec<Vec<f32>> {
+    let layers = sums.len();
+    if layers == 0 {
+        return Vec::new();
+    }
+    let values: Vec<f32> = Tensor::stack::<2>(sums, 0)
+        .mul_scalar(1.0 / loops as f32)
         .cast(burn::tensor::DType::F32)
         .into_data()
         .try_into_vec()
-        .expect("expert slot fractions are f32")
+        .expect("expert slot fractions are f32");
+    let width = values.len() / layers;
+    values.chunks(width).map(<[f32]>::to_vec).collect()
 }
 
 /// Greedy continuation. `ids` is the prompt; returned ids include the prompt and the new tokens.
@@ -371,6 +394,115 @@ pub fn greedy_continue(
         }
     }
     ids
+}
+
+/// How [`sample_continue`] picks each new token.
+#[derive(Debug, Clone)]
+pub struct GenerateOptions {
+    /// Fixed loop count `r`.
+    pub loops: usize,
+    pub max_new: usize,
+    /// Softmax temperature. 0 is greedy.
+    pub temperature: f32,
+    /// Sample among the `top_k` most likely ids. 0 keeps the whole vocabulary.
+    pub top_k: usize,
+    /// Logits of ids already in the window are divided by this (multiplied when negative).
+    /// 1.0 turns it off.
+    pub repetition_penalty: f32,
+    pub seed: u64,
+}
+
+/// Sampled continuation. Stops after `max_new` ids or on an id in `stop`.
+/// Returns only the new ids, without the stop id.
+pub fn sample_continue(
+    model: &LoopMind,
+    mut ids: Vec<u32>,
+    options: &GenerateOptions,
+    stop: &[u32],
+    device: &burn::tensor::Device,
+) -> Vec<u32> {
+    let context = model.config.context_length.max(1);
+    let mut rng = TrainRng::new(options.seed);
+    let mut produced = Vec::new();
+    for _ in 0..options.max_new {
+        if ids.is_empty() {
+            break;
+        }
+        let window = if ids.len() > context {
+            &ids[ids.len() - context..]
+        } else {
+            ids.as_slice()
+        };
+        let flat: Vec<i32> = window.iter().map(|id| *id as i32).collect();
+        let tokens = Tensor::<2, Int>::from_data(TensorData::new(flat, [1, window.len()]), device);
+        let mut logits: Vec<f32> = model
+            .forward(tokens, options.loops)
+            .logits
+            .narrow(1, window.len() - 1, 1)
+            .reshape([model.config.vocab_size])
+            .cast(burn::tensor::DType::F32)
+            .into_data()
+            .try_into_vec()
+            .expect("logits are f32");
+        if options.repetition_penalty != 1.0 {
+            let mut seen = vec![false; logits.len()];
+            for id in window {
+                seen[*id as usize] = true;
+            }
+            for (logit, was_seen) in logits.iter_mut().zip(seen) {
+                if was_seen {
+                    *logit = if *logit > 0.0 {
+                        *logit / options.repetition_penalty
+                    } else {
+                        *logit * options.repetition_penalty
+                    };
+                }
+            }
+        }
+        let next = pick_token(&logits, options, &mut rng);
+        if stop.contains(&next) {
+            break;
+        }
+        ids.push(next);
+        produced.push(next);
+    }
+    produced
+}
+
+fn pick_token(logits: &[f32], options: &GenerateOptions, rng: &mut TrainRng) -> u32 {
+    let argmax = || {
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index as u32)
+            .unwrap_or(0)
+    };
+    if options.temperature <= 0.0 {
+        return argmax();
+    }
+    let mut order: Vec<usize> = (0..logits.len()).collect();
+    order.sort_unstable_by(|left, right| logits[*right].total_cmp(&logits[*left]));
+    if options.top_k > 0 {
+        order.truncate(options.top_k);
+    }
+    let top = logits[order[0]];
+    let weights: Vec<f64> = order
+        .iter()
+        .map(|index| f64::from((logits[*index] - top) / options.temperature).exp())
+        .collect();
+    let total: f64 = weights.iter().sum();
+    if !(total.is_finite() && total > 0.0) {
+        return argmax();
+    }
+    let mut draw = rng.uniform() * total;
+    for (index, weight) in order.iter().zip(&weights) {
+        if draw < *weight {
+            return *index as u32;
+        }
+        draw -= weight;
+    }
+    order[order.len() - 1] as u32
 }
 
 fn add_aux(sum: Option<Tensor<1>>, next: Tensor<1>) -> Tensor<1> {

@@ -4,7 +4,7 @@
 
 LoopMind is a tiny English-first language model trained end to end in Rust. The pipeline follows [MiniMind](https://github.com/jingyaogong/minimind): train a tokenizer, pretrain, supervised-finetune, then chat. The network is a Huginn-style recurrent-depth transformer whose shared core is a fine-grained mixture of experts.
 
-M0 is the workspace, config, parameter census, and CI. M1 is the Burn forward pass, gradient checks, a PyTorch parity test, and a one-layer Burn vs Candle timing check. M2 is the tokenizer, M3 the data pipeline, and M4 the pretrain loop.
+M0 is the workspace, config, parameter census, and CI. M1 is the Burn forward pass, gradient checks, a PyTorch parity test, and a one-layer Burn vs Candle timing check. M2 is the tokenizer, M3 the data pipeline, M4 the pretrain loop, and M5 supervised finetuning plus the chat CLI.
 
 The training pipeline is inspired by Jingyao Gong's [MiniMind](https://github.com/jingyaogong/minimind). The recurrence follows Huginn ([Geiping et al., 2025](https://arxiv.org/abs/2502.05171)): a prelude, a core that loops at train time and at inference time, and a coda. The wide, sparse expert layers follow MoEUT (Csordás et al., NeurIPS 2024; [code](https://github.com/RobertCsordas/moeut)). LoopMind uses ordinary grouped-query attention and SwiGLU experts. MoEUT routes attention as well, and its experts are ReLU.
 
@@ -101,13 +101,15 @@ cargo run -p loopmind -- params --config configs/default.toml
 cargo test --workspace
 ```
 
-`sft` and `chat` are stubs. Each prints the milestone that will implement it and exits 0. `sft` also prints the data plan. Preparing the shards, then pretraining:
+Preparing the shards, pretraining, finetuning, then chatting:
 
 ```bash
 cargo run -p loopmind --release -- prepare-pretrain --config configs/data.toml
 cargo run -p loopmind --release -- prepare-sft --config configs/data.toml
 cargo run -p loopmind --release --features cuda -- pretrain --config configs/pretrain.toml --device cuda
-cargo run -p loopmind --release -- sample --checkpoint runs/pretrain/checkpoints/step-00000200 --prompt "Once upon a time" --loops 4
+cargo run -p loopmind --release -- sample --checkpoint runs/pretrain --prompt "Once upon a time" --loops 4
+cargo run -p loopmind --release --features cuda -- sft --config configs/sft.toml --device cuda
+cargo run -p loopmind --release --features cuda -- chat --checkpoint runs/sft --device cuda
 ```
 
 Train and use the tokenizer:
@@ -145,13 +147,13 @@ cargo run -p moe-bakeoff --release --features cuda   # RTX 4070 Laptop, needs th
 | M2 | 6400-vocab byte-level BPE, chat template, and loss mask. Done. See [docs/tokenizer.md](docs/tokenizer.md). |
 | M3 | Data pipeline for the pretrain mix and the English SFT split. Done. See [docs/data.md](docs/data.md). |
 | M4 | Pretrain loop: AdamW, sampled loop counts, truncated backprop, checkpoints. Done. See [docs/pretrain.md](docs/pretrain.md). |
-| M5 | SFT and the chat CLI. |
+| M5 | SFT and the chat CLI. Done. See [docs/sft.md](docs/sft.md). |
 
 DPO comes after these milestones.
 
 ## Hardware
 
-Development target is an NVIDIA GeForce RTX 4070 Laptop with 8 GB. Build that box with `--features cuda`. The model is about 10M parameters with a 1024-token context, which is the size aimed at that card. An f32 pretrain step on that card holds at about 7.4 GB and runs at about 4,100 tok/s, so one epoch is about 3.5 hours. The numbers are in [docs/pretrain.md](docs/pretrain.md).
+Development target is an NVIDIA GeForce RTX 4070 Laptop with 8 GB. Build that box with `--features cuda`. The model is about 10M parameters with a 1024-token context, which is the size aimed at that card. An f32 pretrain step on that card stays under 7.7 GB and, with the fused expert matmuls, runs at about 12,000 tok/s, so one epoch is about 70 minutes. The numbers are in [docs/pretrain.md](docs/pretrain.md).
 
 `wgpu` is the portable GPU feature for machines without CUDA. CI is CPU-only and uses Burn's `flex` backend. The toolchain is stable Rust (`rust-toolchain.toml`); Burn 0.22 sets the minimum at 1.95.
 

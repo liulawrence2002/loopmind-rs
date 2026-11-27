@@ -58,21 +58,19 @@ impl Attention {
         }
     }
 
-    pub(crate) fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+    pub(crate) fn forward(&self, x: Tensor<3>, ctx: &AttnContext) -> Tensor<3> {
         let [batch, seq, _] = x.dims();
         let q = self.project_heads(self.q.forward(x.clone()), self.n_q_heads, batch, seq);
         let k = self.project_heads(self.k.forward(x.clone()), self.n_kv_heads, batch, seq);
         let v = self.project_heads(self.v.forward(x), self.n_kv_heads, batch, seq);
-        let (cos, sin) = rope_tables(seq, self.head_dim, self.rope_theta, &q.device());
-        let q = apply_rope(q, &cos, &sin);
-        let k = apply_rope(k, &cos, &sin);
+        let q = apply_rope(q, &ctx.cos, &ctx.sin);
+        let k = apply_rope(k, &ctx.cos, &ctx.sin);
         let n_rep = self.n_q_heads / self.n_kv_heads;
         let k = repeat_kv(k, n_rep);
         let v = repeat_kv(v, n_rep);
         let scale = (self.head_dim as f32).sqrt();
         let scores = q.matmul(k.swap_dims(2, 3)) / scale;
-        let mask = causal_mask(batch, self.n_q_heads, seq, &scores.device());
-        let scores = scores.mask_fill(mask, CAUSAL_FILL);
+        let scores = scores.mask_fill(ctx.mask.clone(), CAUSAL_FILL);
         let probs = softmax(scores, 3);
         let context =
             probs
@@ -92,6 +90,37 @@ impl Attention {
         projected
             .reshape([batch, seq, heads, self.head_dim])
             .swap_dims(1, 2)
+    }
+}
+
+/// RoPE tables and the causal mask for one `[batch, seq]` forward.
+///
+/// Every attention layer and every loop pass sees the same positions, so the
+/// tables are built once per forward instead of once per attention call.
+#[derive(Debug, Clone)]
+pub(crate) struct AttnContext {
+    cos: Tensor<4>,
+    sin: Tensor<4>,
+    mask: Tensor<4, Bool>,
+}
+
+impl AttnContext {
+    pub(crate) fn new(config: &LoopMindConfig, batch: usize, seq: usize, device: &Device) -> Self {
+        let (cos, sin) = rope_tables(seq, config.head_dim(), config.rope_theta, device);
+        Self {
+            cos,
+            sin,
+            mask: causal_mask(batch, config.n_q_heads, seq, device),
+        }
+    }
+
+    /// Match the dtype of the activations, so a bf16 model does not multiply by f32 tables.
+    pub(crate) fn cast(self, dtype: burn::tensor::DType) -> Self {
+        Self {
+            cos: self.cos.cast(dtype),
+            sin: self.sin.cast(dtype),
+            mask: self.mask,
+        }
     }
 }
 
@@ -198,11 +227,76 @@ impl Mixture {
         x: Tensor<3>,
         force_routes: Option<Tensor<3, Int>>,
     ) -> (Tensor<3>, Tensor<1>, Tensor<1>) {
+        self.forward_fused(x, force_routes, &self.fuse())
+    }
+
+    /// The experts' weights side by side, for [`Mixture::forward_fused`].
+    ///
+    /// The core is shared across loop passes, so a forward builds this once per
+    /// layer and every pass reuses it. Gradients flow back through the concat to
+    /// each expert's own `Linear`, so the checkpoint layout does not change.
+    pub(crate) fn fuse(&self) -> FusedExperts {
+        let gate = Tensor::cat(
+            self.experts
+                .iter()
+                .map(|expert| expert.gate.weight.val())
+                .collect(),
+            1,
+        );
+        let up = Tensor::cat(
+            self.experts
+                .iter()
+                .map(|expert| expert.up.weight.val())
+                .collect(),
+            1,
+        );
+        let down = Tensor::cat(
+            self.experts
+                .iter()
+                .map(|expert| expert.down.weight.val())
+                .collect(),
+            0,
+        );
+        FusedExperts { gate, up, down }
+    }
+
+    /// Every expert evaluated as one wide SwiGLU.
+    ///
+    /// `down_e(h_e) * g_e` summed over experts equals `concat_e(h_e * g_e) @ concat_e(down_e)`,
+    /// so three `[tokens, n_experts * width]` matmuls replace `3 * n_experts` small ones.
+    pub(crate) fn forward_fused(
+        &self,
+        x: Tensor<3>,
+        force_routes: Option<Tensor<3, Int>>,
+        fused: &FusedExperts,
+    ) -> (Tensor<3>, Tensor<1>, Tensor<1>) {
         let [batch, seq, d_model] = x.dims();
         let tokens = batch * seq;
         let flat = x.reshape([tokens, d_model]);
+        let (indices, probs, gates) = self.route(flat.clone(), force_routes);
         let n_experts = self.experts.len();
-        let logits = self.router.forward(flat.clone());
+        let width = fused.gate.dims()[1] / n_experts;
+        let hidden = silu(flat.clone().matmul(fused.gate.clone())) * flat.matmul(fused.up.clone());
+        let scale = gates
+            .cast(hidden.dtype())
+            .unsqueeze_dim::<3>(2)
+            .repeat_dim(2, width)
+            .reshape([tokens, n_experts * width]);
+        let mixed = (hidden * scale).matmul(fused.down.clone());
+        let slots = slot_fraction(&indices, n_experts, self.top_k);
+        let aux = balance_loss(&probs, &slots, n_experts);
+        (mixed.reshape([batch, seq, d_model]), aux, slots)
+    }
+
+    /// Top-k ids, router probabilities, and the `[tokens, n_experts]` gate matrix.
+    fn route(
+        &self,
+        flat: Tensor<2>,
+        force_routes: Option<Tensor<3, Int>>,
+    ) -> (Tensor<2, Int>, Tensor<2>, Tensor<2>) {
+        let tokens = flat.dims()[0];
+        let n_experts = self.experts.len();
+        let logits = self.router.forward(flat);
         let probs = softmax(logits, 1);
         let indices = match force_routes {
             Some(routes) => routes.reshape([tokens, self.top_k]),
@@ -216,6 +310,21 @@ impl Mixture {
             weights
         };
         let gates = route_gates(&indices, &weights, n_experts);
+        (indices, probs, gates)
+    }
+
+    /// The M1 per-expert loop. Tests check the fused path against it.
+    #[cfg(test)]
+    pub(crate) fn forward_unfused(
+        &self,
+        x: Tensor<3>,
+        force_routes: Option<Tensor<3, Int>>,
+    ) -> (Tensor<3>, Tensor<1>, Tensor<1>) {
+        let [batch, seq, d_model] = x.dims();
+        let tokens = batch * seq;
+        let flat = x.reshape([tokens, d_model]);
+        let (indices, probs, gates) = self.route(flat.clone(), force_routes);
+        let n_experts = self.experts.len();
         let mut mixed = Tensor::<2>::zeros([tokens, d_model], &flat.device());
         for (expert_id, expert) in self.experts.iter().enumerate() {
             let column = gates.clone().narrow(1, expert_id, 1);
@@ -227,10 +336,24 @@ impl Mixture {
     }
 }
 
+/// Concatenated expert weights: gate and up are `[d_model, n_experts * width]`,
+/// down is `[n_experts * width, d_model]`.
+#[derive(Debug, Clone)]
+pub(crate) struct FusedExperts {
+    gate: Tensor<2>,
+    up: Tensor<2>,
+    down: Tensor<2>,
+}
+
 /// Per-token expert coefficients, shape `[tokens, n_experts]`.
 fn route_gates(indices: &Tensor<2, Int>, weights: &Tensor<2>, n_experts: usize) -> Tensor<2> {
     let tokens = indices.dims()[0];
-    let assignment = indices.clone().float().one_hot::<3>(n_experts);
+    // Int ids become f32. Match the router's dtype so a bf16 model does not mix the two.
+    let assignment = indices
+        .clone()
+        .float()
+        .cast(weights.dtype())
+        .one_hot::<3>(n_experts);
     let weighted = assignment * weights.clone().unsqueeze_dim::<3>(2);
     weighted.sum_dim(1).reshape([tokens, n_experts])
 }
@@ -245,7 +368,7 @@ fn slot_fraction(indices: &Tensor<2, Int>, n_experts: usize, top_k: usize) -> Te
 /// `n_experts * sum_i f_i P_i`, where `f` is the fraction of top-k slots and `P` is the mean router probability.
 fn balance_loss(probs: &Tensor<2>, slot_fraction: &Tensor<1>, n_experts: usize) -> Tensor<1> {
     let mean_prob = probs.clone().mean_dim(0).reshape([n_experts]);
-    (slot_fraction.clone() * mean_prob).sum() * (n_experts as f32)
+    (slot_fraction.clone().cast(mean_prob.dtype()) * mean_prob).sum() * (n_experts as f32)
 }
 
 /// Pre-norm transformer layer with a dense SwiGLU.
@@ -267,8 +390,8 @@ impl DenseBlock {
         }
     }
 
-    pub(crate) fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let x = x.clone() + self.attn.forward(self.attn_norm.forward(x));
+    pub(crate) fn forward(&self, x: Tensor<3>, ctx: &AttnContext) -> Tensor<3> {
+        let x = x.clone() + self.attn.forward(self.attn_norm.forward(x), ctx);
         x.clone() + self.ffn.forward(self.ffn_norm.forward(x))
     }
 }
@@ -296,11 +419,13 @@ impl MoeBlock {
         &self,
         x: Tensor<3>,
         force_routes: Option<Tensor<3, Int>>,
+        ctx: &AttnContext,
+        fused: &FusedExperts,
     ) -> (Tensor<3>, Tensor<1>, Tensor<1>) {
-        let x = x.clone() + self.attn.forward(self.attn_norm.forward(x));
-        let (ffn_out, aux, slots) = self
-            .moe
-            .forward(self.ffn_norm.forward(x.clone()), force_routes);
+        let x = x.clone() + self.attn.forward(self.attn_norm.forward(x), ctx);
+        let (ffn_out, aux, slots) =
+            self.moe
+                .forward_fused(self.ffn_norm.forward(x.clone()), force_routes, fused);
         (x + ffn_out, aux, slots)
     }
 }

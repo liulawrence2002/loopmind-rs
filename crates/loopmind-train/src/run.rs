@@ -9,13 +9,13 @@ use std::time::Instant;
 
 /// One training run at a time. Burn's CPU RNG is process-global, so two
 /// overlapping `pretrain` calls in one process would mix their initializers.
-static RUN_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static RUN_LOCK: Mutex<()> = Mutex::new(());
 
 use loopmind_data::{EpochCursor, PretrainLoader};
 use loopmind_model::{EngineDevice, LoopMindConfig, OptimSettings, Precision, PretrainEngine};
 use serde::{Deserialize, Serialize};
 
-use crate::config::PretrainConfig;
+use crate::config::{OptimConfig, PretrainConfig};
 use crate::schedule::learning_rate;
 use crate::TrainError;
 
@@ -27,14 +27,14 @@ pub struct RunOverrides {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CheckpointMeta {
-    step: u64,
-    cursor: EpochCursor,
-    rng_state: u64,
-    tokens_seen: u64,
-    precision: String,
-    schedule_steps: u64,
-    model_toml: String,
+pub(crate) struct CheckpointMeta {
+    pub(crate) step: u64,
+    pub(crate) cursor: EpochCursor,
+    pub(crate) rng_state: u64,
+    pub(crate) tokens_seen: u64,
+    pub(crate) precision: String,
+    pub(crate) schedule_steps: u64,
+    pub(crate) model_toml: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,7 +93,7 @@ pub fn pretrain(
     let steps_per_epoch = loader.len().div_ceil(micro * accum as u64).max(1);
     let schedule_steps = steps_per_epoch.saturating_mul(config.epochs).max(1);
     fs::create_dir_all(&config.run_dir)?;
-    let settings = optim_settings(config);
+    let settings = optim_settings(&config.optim);
     let (mut engine, mut cursor, mut step, mut tokens_seen, schedule_steps) = if overrides.resume {
         let meta = read_latest(&config.run_dir)?;
         let dir = checkpoint_dir(&config.run_dir, meta.step);
@@ -176,6 +176,19 @@ pub fn pretrain(
         let flops = model_config.train_flops_per_token(mean_loops.max(1.0))?;
         let tokens_per_sec = step_tokens as f64 / elapsed;
         let mfu = (flops * step_tokens as f64) / elapsed / (config.peak_tflops * 1.0e12);
+        // Save before validating, so a failed validation never costs the step's checkpoint.
+        if config.checkpoint.every > 0 && step.is_multiple_of(config.checkpoint.every) {
+            save_checkpoint(
+                &config.run_dir,
+                config.checkpoint.keep,
+                &engine,
+                &model_config,
+                &cursor,
+                step,
+                tokens_seen,
+                schedule_steps,
+            )?;
+        }
         let mut val_loss = BTreeMap::new();
         if config.log.val_every > 0 && step.is_multiple_of(config.log.val_every) {
             val_loss = validate(&engine, &val_dir, config)?;
@@ -206,20 +219,10 @@ pub fn pretrain(
             append_log(&config.run_dir.join("metrics.jsonl"), &row)?;
             print_row(&row);
         }
-        if config.checkpoint.every > 0 && step.is_multiple_of(config.checkpoint.every) {
-            save_checkpoint(
-                config,
-                &engine,
-                &model_config,
-                &cursor,
-                step,
-                tokens_seen,
-                schedule_steps,
-            )?;
-        }
     }
     save_checkpoint(
-        config,
+        &config.run_dir,
+        config.checkpoint.keep,
         &engine,
         &model_config,
         &cursor,
@@ -244,28 +247,62 @@ pub fn generate(
     eos: u32,
     device: &str,
 ) -> Result<Vec<u32>, TrainError> {
-    let meta: CheckpointMeta =
-        serde_json::from_str(&fs::read_to_string(checkpoint.join("state.json"))?)?;
+    let engine = load_inference(checkpoint, device)?;
+    Ok(engine.greedy(prompt_ids.to_vec(), loops, max_new, eos))
+}
+
+/// A checkpoint directory (holding `model.bpk`), or a run directory whose
+/// `latest.json` names one.
+pub fn resolve_checkpoint(path: &Path) -> Result<PathBuf, TrainError> {
+    if path.join("model.bpk").is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if path.join("latest.json").is_file() {
+        let meta = read_latest(path)?;
+        let dir = checkpoint_dir(path, meta.step);
+        if dir.join("model.bpk").is_file() {
+            return Ok(dir);
+        }
+        return Err(TrainError::new(format!(
+            "{} names step {} but {} has no model.bpk",
+            path.join("latest.json").display(),
+            meta.step,
+            dir.display()
+        )));
+    }
+    Err(TrainError::new(format!(
+        "{} is neither a checkpoint (model.bpk) nor a run directory (latest.json)",
+        path.display()
+    )))
+}
+
+/// The model config stored with a checkpoint.
+pub(crate) fn checkpoint_model(dir: &Path) -> Result<(CheckpointMeta, LoopMindConfig), TrainError> {
+    let meta: CheckpointMeta = serde_json::from_str(&fs::read_to_string(dir.join("state.json"))?)?;
     let model_config = LoopMindConfig::from_toml_str(&meta.model_toml)?;
+    Ok((meta, model_config))
+}
+
+/// Weights only, for sampling and chat. The optimizer state is not read.
+pub fn load_inference(checkpoint: &Path, device: &str) -> Result<PretrainEngine, TrainError> {
+    let dir = resolve_checkpoint(checkpoint)?;
+    let (_, model_config) = checkpoint_model(&dir)?;
     let kind = EngineDevice::parse(device)?;
     let settings = OptimSettings {
-        weight_decay: 0.1,
+        weight_decay: 0.0,
         beta1: 0.9,
         beta2: 0.95,
         epsilon: 1e-8,
-        grad_clip: 1.0,
+        grad_clip: 0.0,
     };
-    let engine = PretrainEngine::load(
+    Ok(PretrainEngine::from_weights(
         &model_config,
         1,
         kind,
         settings,
-        &checkpoint.join("model.bpk"),
-        &checkpoint.join("optim.bpk"),
-        meta.rng_state,
-        meta.precision,
-    )?;
-    Ok(engine.greedy(prompt_ids.to_vec(), loops, max_new, eos))
+        &dir.join("model.bpk"),
+        Precision::F32,
+    )?)
 }
 
 fn validate(
@@ -297,8 +334,10 @@ fn validate(
     Ok(losses)
 }
 
-fn save_checkpoint(
-    config: &PretrainConfig,
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn save_checkpoint(
+    run_dir: &Path,
+    keep: usize,
     engine: &PretrainEngine,
     model_config: &LoopMindConfig,
     cursor: &EpochCursor,
@@ -306,7 +345,7 @@ fn save_checkpoint(
     tokens_seen: u64,
     schedule_steps: u64,
 ) -> Result<(), TrainError> {
-    let dir = checkpoint_dir(&config.run_dir, step);
+    let dir = checkpoint_dir(run_dir, step);
     fs::create_dir_all(&dir)?;
     engine.save(&dir.join("model.bpk"), &dir.join("optim.bpk"))?;
     let meta = CheckpointMeta {
@@ -321,10 +360,10 @@ fn save_checkpoint(
     };
     fs::write(dir.join("state.json"), serde_json::to_vec_pretty(&meta)?)?;
     fs::write(
-        config.run_dir.join("latest.json"),
+        run_dir.join("latest.json"),
         serde_json::to_vec_pretty(&meta)?,
     )?;
-    prune(&config.run_dir, config.checkpoint.keep)?;
+    prune(run_dir, keep)?;
     Ok(())
 }
 
@@ -354,7 +393,7 @@ fn prune(run_dir: &Path, keep: usize) -> Result<(), TrainError> {
     Ok(())
 }
 
-fn read_latest(run_dir: &Path) -> Result<CheckpointMeta, TrainError> {
+pub(crate) fn read_latest(run_dir: &Path) -> Result<CheckpointMeta, TrainError> {
     let path = run_dir.join("latest.json");
     if !path.is_file() {
         return Err(TrainError::new(format!(
@@ -365,11 +404,11 @@ fn read_latest(run_dir: &Path) -> Result<CheckpointMeta, TrainError> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
-fn checkpoint_dir(run_dir: &Path, step: u64) -> PathBuf {
+pub(crate) fn checkpoint_dir(run_dir: &Path, step: u64) -> PathBuf {
     run_dir.join("checkpoints").join(format!("step-{step:08}"))
 }
 
-fn append_log(path: &Path, row: &LogRow) -> Result<(), TrainError> {
+pub(crate) fn append_log<T: Serialize>(path: &Path, row: &T) -> Result<(), TrainError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -413,24 +452,24 @@ fn print_row(row: &LogRow) {
     );
 }
 
-fn optim_settings(config: &PretrainConfig) -> OptimSettings {
+pub(crate) fn optim_settings(optim: &OptimConfig) -> OptimSettings {
     OptimSettings {
-        weight_decay: config.optim.weight_decay as f32,
-        beta1: config.optim.beta1 as f32,
-        beta2: config.optim.beta2 as f32,
-        epsilon: config.optim.epsilon as f32,
-        grad_clip: config.optim.grad_clip as f32,
+        weight_decay: optim.weight_decay as f32,
+        beta1: optim.beta1 as f32,
+        beta2: optim.beta2 as f32,
+        epsilon: optim.epsilon as f32,
+        grad_clip: optim.grad_clip as f32,
     }
 }
 
-fn mean(values: &[f32]) -> f32 {
+pub(crate) fn mean(values: &[f32]) -> f32 {
     if values.is_empty() {
         return 0.0;
     }
     values.iter().sum::<f32>() / values.len() as f32
 }
 
-fn loop_hist(loops: &[usize]) -> BTreeMap<String, u64> {
+pub(crate) fn loop_hist(loops: &[usize]) -> BTreeMap<String, u64> {
     let mut counts = BTreeMap::new();
     for value in loops {
         *counts.entry(value.to_string()).or_insert(0) += 1;
@@ -438,7 +477,7 @@ fn loop_hist(loops: &[usize]) -> BTreeMap<String, u64> {
     counts
 }
 
-fn add_slots(acc: &mut [Vec<f32>], extra: &[Vec<f32>]) {
+pub(crate) fn add_slots(acc: &mut [Vec<f32>], extra: &[Vec<f32>]) {
     for (layer, next) in acc.iter_mut().zip(extra) {
         for (value, add) in layer.iter_mut().zip(next) {
             *value += *add;
@@ -446,7 +485,7 @@ fn add_slots(acc: &mut [Vec<f32>], extra: &[Vec<f32>]) {
     }
 }
 
-fn scale_slots(slots: &mut [Vec<f32>], scale: f32) {
+pub(crate) fn scale_slots(slots: &mut [Vec<f32>], scale: f32) {
     for layer in slots {
         for value in layer {
             *value *= scale;

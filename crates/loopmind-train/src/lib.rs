@@ -1,4 +1,4 @@
-//! Pretrain loop. SFT stays a stub until M5.
+//! Pretrain (M4) and SFT (M5) loops.
 //!
 //! Burn stays in `loopmind-model`. This crate owns the epoch cursor, the
 //! learning-rate schedule, the logs, and the checkpoints.
@@ -7,11 +7,13 @@ mod config;
 mod error;
 mod run;
 mod schedule;
+mod sft;
 
-pub use config::PretrainConfig;
+pub use config::{PretrainConfig, SftConfig};
 pub use error::TrainError;
-pub use run::{generate, pretrain, RunOverrides, RunSummary};
+pub use run::{generate, load_inference, pretrain, resolve_checkpoint, RunOverrides, RunSummary};
 pub use schedule::learning_rate;
+pub use sft::sft;
 
 /// Milestone that owns the pretrain loop.
 pub const PRETRAIN_MILESTONE: &str = "M4";
@@ -24,9 +26,9 @@ pub fn pretrain_status() -> &'static str {
     "M4 pretrain loop"
 }
 
-/// What `loopmind sft` reports until M5.
+/// What `loopmind sft` is.
 pub fn sft_status() -> &'static str {
-    "sft is not implemented yet (planned for M5)"
+    "M5 SFT loop"
 }
 
 #[cfg(test)]
