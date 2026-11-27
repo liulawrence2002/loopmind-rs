@@ -40,6 +40,37 @@ Each new width costs CubeCL kernel compiles and an autotune pass, so 64 was fast
 
 Validation uses held-out rows: `eval.jsonl` is 2,000 checkable rows that are not in the train shards. The validation loss is the same token-mean masked NLL. It is not an accuracy.
 
+## The 4070 run
+
+On 2026-11-27, from the final pretrain checkpoint (step 6,000), the run took 3 h 32 min: all 19,190 steps in one attempt, with no restarts. It used CUDA f32. It averaged 9,050 padded tokens/s (MFU 1.7%) and a mean sampled `r` of 4.02. It covered 111.9M padded tokens and 45.5M supervised targets.
+
+| Step | Epoch | r = 1 | r = 2 | r = 4 | r = 8 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 500 | 1 | 3.340 | 3.219 | 3.231 | 3.337 |
+| 2,000 | 1 | 2.632 | 2.474 | 2.458 | 2.599 |
+| 5,000 | 1 | 2.137 | 1.987 | 1.956 | 2.051 |
+| 9,500 | 1 | 1.867 | 1.729 | 1.696 | 1.771 |
+| 12,000 | 2 | 1.808 | 1.673 | 1.640 | 1.698 |
+| 15,000 | 2 | 1.752 | 1.620 | 1.589 | 1.643 |
+| 19,190 | 2 | **1.714** | **1.587** | **1.556** | **1.608** |
+
+Validation masked loss on the first 128 eval rows. The full curve is in `runs/sft/metrics.jsonl`.
+
+- From step 2,000 on, r = 4 is the best of the four. Its lead over r = 1 peaked at 0.20 nats around step 4,500 and ended at 0.16. r = 8 is worse than r = 4 at every point, Training draws `r` from a clamped Poisson with mean 4, so only 5.1% of training rows ran 8 or more passes. The loop dial is tuned after training ([refine.md](refine.md)).
+- The second epoch took r = 4 from 1.696 to 1.556. It was still falling at the end, at about 0.004 per 500 steps, as the cosine schedule neared its 1e-5 floor.
+- The mean train loss over the last 500 steps was 1.81. Train loss is noisier than validation, because a step's 16 rows vary in length and config.
+
+`runs/sft/samples.txt` holds greedy answers at r = 4 to the first four eval prompts, all grade-school math, with no repetition penalty. The model has learned the answer format, such as `Let's denote ... as \( x \).` and `Final answer:`. Its arithmetic is wrong, and three of the four answers fall into a loop that repeats one phrase:
+
+```text
+He spent 4*4=12 hours a day
+So he spent 12+12=8 hours a day
+
+Final answer: 8
+```
+
+The reference answer is 12. The `chat` defaults add a repetition penalty of 1.1 and sampling for this reason.
+
 ## Chat
 
 ```bash
