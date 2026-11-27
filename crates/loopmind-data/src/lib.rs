@@ -14,7 +14,8 @@ mod shard;
 pub use config::DataConfig;
 pub use error::DataError;
 pub use loader::{
-    read_sft_eval, EpochCursor, PretrainBatch, PretrainLoader, SftBatch, SftEvalRow, SftLoader,
+    epoch_order, read_sft_eval, split_final_answer, EpochCursor, PretrainBatch, PretrainLoader,
+    SftBatch, SftEvalRow, SftLoader,
 };
 pub use plan::{
     pretrain_tokens, scaled_budgets, CorpusSlice, SftPolicy, PRETRAIN_SLICES,
@@ -23,6 +24,6 @@ pub use plan::{
 pub use pretrain::{prepare_pretrain, PretrainManifest, SourceReport};
 pub use sft::{prepare_sft, ChatRow, DropCounts, SftManifest};
 pub use shard::{
-    read_pretrain_sequence, read_pretrain_shard, write_pretrain_shard, write_sft_shard,
-    PretrainShard, SftRow,
+    read_pretrain_sequence, read_pretrain_shard, read_sft_shard, write_pretrain_shard,
+    write_sft_shard, PretrainShard, SftRow,
 };

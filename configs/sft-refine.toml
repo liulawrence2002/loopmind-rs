@@ -1,0 +1,39 @@
+# Refinement pass after M5: one more epoch over the same chat split, from the final SFT
+# checkpoint, at a tenth of the SFT learning rate. scripts/refine.sh keeps it only if
+# the held-out masked loss improves.
+
+init = "runs/sft"
+data_dir = "data/prepared/sft"
+run_dir = "runs/sft-refine"
+tokenizer = "tokenizer/tokenizer.json"
+seed = 43
+epochs = 1
+max_steps = 0
+device = "cpu"
+precision = "f32"
+peak_tflops = 15.0
+pad_multiple = 64
+val_loops = [1, 2, 4, 8]
+
+[optim]
+learning_rate = 2.0e-5
+min_learning_rate = 2.0e-6
+weight_decay = 0.1
+beta1 = 0.9
+beta2 = 0.95
+epsilon = 1.0e-8
+grad_clip = 1.0
+warmup_steps = 50
+
+[batch]
+rows_per_step = 16
+
+[log]
+every = 1
+val_every = 500
+val_rows = 128
+samples = 4
+
+[checkpoint]
+every = 500
+keep = 3

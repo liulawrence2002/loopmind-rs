@@ -30,6 +30,19 @@ pub fn masked_shifted_nll_sum(
     tokens: Tensor<2, Int>,
     mask: Tensor<2, Int>,
 ) -> Tensor<1> {
+    masked_shifted_logprob_rows(logits, tokens, mask)
+        .sum()
+        .neg()
+}
+
+/// Per-row sum of next-token log-probabilities over supervised targets, `[batch]`.
+///
+/// DPO scores a response by this sum: the log-probability of the masked tokens.
+pub fn masked_shifted_logprob_rows(
+    logits: Tensor<3>,
+    tokens: Tensor<2, Int>,
+    mask: Tensor<2, Int>,
+) -> Tensor<1> {
     let [batch, seq, _] = logits.dims();
     assert!(seq >= 2, "shifted loss needs at least two tokens");
     let dtype = logits.dtype();
@@ -40,7 +53,7 @@ pub fn masked_shifted_nll_sum(
     let picked = log_probs
         .gather(2, targets.unsqueeze_dim::<3>(2))
         .reshape([batch, seq - 1]);
-    (picked * weights).sum().neg()
+    (picked * weights).sum_dim(1).reshape([batch])
 }
 
 #[cfg(test)]
@@ -60,5 +73,22 @@ mod tests {
         let sum = masked_shifted_nll_sum(logits, tokens, mask).into_scalar::<f32>();
         // Position 0 is never a target, so two targets (tokens 2 and 3) are counted.
         assert!((sum - 2.0 * (vocab as f32).ln()).abs() < 1e-5, "{sum}");
+    }
+
+    #[test]
+    fn row_logprobs_split_the_masked_sum_by_row() {
+        let device = Device::flex();
+        let logits = Tensor::<3>::zeros([2, 3, 4], &device);
+        let tokens =
+            Tensor::<2, Int>::from_data(TensorData::new(vec![0, 1, 2, 0, 3, 3], [2, 3]), &device);
+        let mask =
+            Tensor::<2, Int>::from_data(TensorData::new(vec![0, 1, 1, 0, 0, 1], [2, 3]), &device);
+        let rows = masked_shifted_logprob_rows(logits, tokens, mask)
+            .into_data()
+            .try_into_vec::<f32>()
+            .unwrap();
+        let ln4 = 4f32.ln();
+        assert!((rows[0] + 2.0 * ln4).abs() < 1e-5, "{rows:?}");
+        assert!((rows[1] + ln4).abs() < 1e-5, "{rows:?}");
     }
 }

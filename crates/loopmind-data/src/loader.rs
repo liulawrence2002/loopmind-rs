@@ -43,6 +43,36 @@ impl SftBatch {
         }
     }
 
+    /// Several rows padded with `pad_id` to one width: the longest row, rounded up to a
+    /// multiple of `pad_multiple`. Causal attention means right padding never changes the
+    /// earlier positions, and padding has mask 0.
+    pub fn from_rows(rows: &[SftRow], pad_id: u16, pad_multiple: usize) -> Self {
+        let multiple = pad_multiple.max(1);
+        let longest = rows.iter().map(|row| row.tokens.len()).max().unwrap_or(1);
+        let width = longest.div_ceil(multiple).max(1) * multiple;
+        let mut tokens = vec![pad_id; rows.len() * width];
+        let mut mask = vec![0u8; rows.len() * width];
+        for (index, row) in rows.iter().enumerate() {
+            let start = index * width;
+            tokens[start..start + row.tokens.len()].copy_from_slice(&row.tokens);
+            mask[start..start + row.mask.len()].copy_from_slice(&row.mask);
+        }
+        Self {
+            tokens,
+            mask,
+            batch: rows.len(),
+            seq_len: width,
+        }
+    }
+
+    /// [`SftBatch::supervised_targets`] for each row.
+    pub fn targets_per_row(&self) -> Vec<u64> {
+        self.mask
+            .chunks(self.seq_len.max(1))
+            .map(|row| row.iter().skip(1).filter(|bit| **bit != 0).count() as u64)
+            .collect()
+    }
+
     /// Next-token targets that are trained: mask 1 at positions `1..seq_len` of each row.
     /// Position 0 has no prefix, so it is never a target.
     pub fn supervised_targets(&self) -> u64 {
@@ -362,15 +392,29 @@ impl SftEvalRow {
     /// walking back over the `<|eos|>` run, the newline, and the answer run lands on the
     /// first answer token.
     pub fn prompt(&self) -> &[u16] {
-        let mask = &self.loss_mask;
-        let mut index = mask.len();
-        for want in [1u8, 0, 1] {
-            while index > 0 && mask[index - 1] == want {
-                index -= 1;
-            }
-        }
-        &self.tokens[..index]
+        &self.tokens[..split_final_answer(&self.loss_mask)]
     }
+}
+
+/// Where the final assistant answer starts in a rendered transcript.
+///
+/// A transcript that ends on an assistant turn ends `answer <|im_end|> \n <|eos|>` with
+/// mask `1.. 1 0 1`. Walking back over the `<|eos|>` run, the newline, and the answer run
+/// lands on the first answer token. Everything before it is the prompt, ending with
+/// that turn's `<|im_start|><|assistant|>\n`.
+pub fn split_final_answer(mask: &[u8]) -> usize {
+    let mut index = mask.len();
+    for want in [1u8, 0, 1] {
+        while index > 0 && mask[index - 1] == want {
+            index -= 1;
+        }
+    }
+    index
+}
+
+/// The seeded shuffle of `0..n` that epoch `epoch` of an [`EpochCursor`] walks.
+pub fn epoch_order(n: u32, seed: u64, epoch: u64) -> Vec<u32> {
+    permutation(n, mix_epoch(seed, epoch))
 }
 
 /// The first `limit` rows of `eval.jsonl`, in file order. `limit == 0` reads every row.

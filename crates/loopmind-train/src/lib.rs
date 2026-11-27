@@ -4,13 +4,21 @@
 //! learning-rate schedule, the logs, and the checkpoints.
 
 mod config;
+mod dpo;
 mod error;
+mod eval;
 mod run;
 mod schedule;
+mod score;
 mod sft;
 
-pub use config::{PretrainConfig, SftConfig};
+pub use config::{DpoConfig, PretrainConfig, SftConfig};
+pub use dpo::{dpo, make_pairs, read_pairs, PairOptions, PairReport, PreferencePair};
 pub use error::TrainError;
+pub use eval::{
+    evaluate, read_report, report_markdown, sampling_named, write_report, BestModel, EvalOptions,
+    EvalReport, Sampling, SMOKE_PROMPTS,
+};
 pub use run::{generate, load_inference, pretrain, resolve_checkpoint, RunOverrides, RunSummary};
 pub use schedule::learning_rate;
 pub use sft::sft;

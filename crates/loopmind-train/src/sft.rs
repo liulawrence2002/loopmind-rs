@@ -335,7 +335,7 @@ fn print_row(row: &SftLogRow) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
@@ -347,7 +347,7 @@ mod tests {
     use loopmind_data::{write_pretrain_shard, write_sft_shard, SftRow};
     use loopmind_model::LoopMindConfig;
 
-    fn optim(learning_rate: f64) -> OptimConfig {
+    pub(crate) fn optim(learning_rate: f64) -> OptimConfig {
         OptimConfig {
             learning_rate,
             min_learning_rate: learning_rate / 10.0,
@@ -361,7 +361,7 @@ mod tests {
     }
 
     /// A tiny pretrain run, so SFT has a real checkpoint to start from.
-    fn pretrained(root: &Path) -> PathBuf {
+    pub(crate) fn pretrained(root: &Path) -> PathBuf {
         let data = root.join("pre");
         fs::create_dir_all(data.join("train")).unwrap();
         fs::create_dir_all(data.join("val")).unwrap();
