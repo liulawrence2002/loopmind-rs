@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoopMind chat</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e2e1dc;
+    --accent: #2f6fdb; --accent-ink: #ffffff; --user: #e8efff; --bot: #ffffff; --warn: #b3261e;
+    --code: #f1f0ec;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #9b9a93; --line: #34342f;
+      --accent: #6f9cf0; --accent-ink: #0d1626; --user: #1f2c45; --bot: #23231f; --warn: #f2867d;
+      --code: #2a2a26;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--ink);
+    display: grid; grid-template-rows: auto 1fr; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  header .status { color: var(--muted); font-size: 13px; flex: 1; }
+  button {
+    font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+    border-radius: 8px; padding: 6px 12px; cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button.primary.stop { background: var(--warn); border-color: var(--warn); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  main { display: grid; grid-template-columns: 1fr 320px; min-height: 0; }
+  #chat { display: grid; grid-template-rows: 1fr auto; min-height: 0; }
+  #log { overflow-y: auto; padding: 20px 16px 8px; }
+  .inner { max-width: 780px; margin: 0 auto; }
+  .msg { margin: 0 0 14px; display: flex; flex-direction: column; }
+  .msg.user { align-items: flex-end; }
+  .bubble {
+    padding: 9px 13px; border-radius: 12px; border: 1px solid var(--line);
+    white-space: pre-wrap; overflow-wrap: anywhere; max-width: 92%;
+  }
+  .user .bubble { background: var(--user); border-color: transparent; }
+  .assistant .bubble { background: var(--bot); }
+  .assistant .bubble.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13.5px; }
+  .bubble.live::after { content: "▍"; color: var(--muted); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 4px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .meta button { padding: 0 6px; font-size: 12px; border-radius: 6px; }
+  .error { color: var(--warn); font-size: 13px; margin: 0 0 14px; white-space: pre-wrap; }
+  .empty { color: var(--muted); text-align: center; margin-top: 12vh; }
+  .empty h2 { color: var(--ink); font-size: 20px; font-weight: 600; margin: 0 0 6px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
+  .chips button { border-radius: 999px; font-size: 13px; }
+  #composer { padding: 10px 16px 16px; }
+  #composer form { display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 9px 12px; resize: none; width: 100%;
+  }
+  #input { min-height: 44px; max-height: 200px; }
+  textarea:focus, input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  aside {
+    border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 14px 16px 24px;
+  }
+  aside h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 18px 0 8px; font-weight: 600; }
+  aside h2:first-child { margin-top: 0; }
+  label { display: block; font-size: 13px; margin: 10px 0 4px; }
+  label .value { float: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  select, input[type=number], input[type=text] {
+    font: inherit; width: 100%; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink);
+  }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .presets { display: flex; gap: 6px; flex-wrap: wrap; }
+  .presets button { font-size: 12.5px; padding: 4px 9px; }
+  .presets button.on { border-color: var(--accent); color: var(--accent); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .row { display: flex; gap: 8px; }
+  .row > div { flex: 1; }
+  .check { display: flex; gap: 6px; align-items: center; font-size: 13px; margin-top: 10px; }
+  @media (max-width: 860px) {
+    body { overflow: auto; }
+    main { grid-template-columns: 1fr; }
+    #chat { min-height: 70vh; }
+    aside { border-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>LoopMind</h1>
+  <span class="status" id="status">connecting…</span>
+  <button id="new-chat" type="button">New chat</button>
+</header>
+<main>
+  <section id="chat">
+    <div id="log"><div class="inner" id="messages"></div></div>
+    <div id="composer"><div class="inner">
+      <form id="form">
+        <textarea id="input" rows="1" placeholder="Message LoopMind" autofocus></textarea>
+        <button class="primary" id="send" type="submit">Send</button>
+      </form>
+      <div class="hint">Enter sends, Shift+Enter adds a line, Esc stops. Answers come from your local checkpoint.</div>
+    </div></div>
+  </section>
+  <aside>
+    <h2>Model</h2>
+    <label for="checkpoint">Checkpoint</label>
+    <select id="checkpoint"></select>
+    <div class="note" id="checkpoint-note"></div>
+
+    <label for="loops">Loop count r <span class="value" id="loops-value"></span></label>
+    <input id="loops" type="range" min="1" max="16" step="1">
+    <div class="note" id="loops-note"></div>
+
+    <h2>Sampling</h2>
+    <div class="presets" id="presets">
+      <button type="button" data-t="0" data-k="0">greedy</button>
+      <button type="button" data-t="0.3" data-k="20">t0.3-k20</button>
+      <button type="button" data-t="0.7" data-k="40">t0.7-k40</button>
+    </div>
+    <label for="temperature">Temperature <span class="value" id="temperature-value"></span></label>
+    <input id="temperature" type="range" min="0" max="1.5" step="0.05">
+    <div class="row">
+      <div>
+        <label for="top_k">Top-k</label>
+        <input id="top_k" type="number" min="0" max="6400" step="1">
+      </div>
+      <div>
+        <label for="max_new">Max tokens</label>
+        <input id="max_new" type="number" min="1" max="1024" step="1">
+      </div>
+    </div>
+    <label for="repetition_penalty">Repetition penalty <span class="value" id="repetition_penalty-value"></span></label>
+    <input id="repetition_penalty" type="range" min="1" max="1.6" step="0.01">
+    <label for="seed">Seed</label>
+    <input id="seed" type="text" inputmode="numeric" placeholder="random each answer">
+
+    <h2>Conversation</h2>
+    <label for="system">System message</label>
+    <textarea id="system" rows="3" placeholder="none"></textarea>
+    <label class="check"><input id="history" type="checkbox"> Send earlier turns</label>
+    <div class="note">Off: each message is answered on its own. SFT used single-turn chats, and with earlier turns in context the model tends to repeat its last answer.</div>
+    <label class="check"><input id="mono" type="checkbox"> Monospace answers</label>
+    <div class="note" id="defaults-note"></div>
+    <p><button id="reset-settings" type="button">Reset settings</button></p>
+  </aside>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const STORE = "loopmind-chat-settings";
+const SUGGESTIONS = [
+  "What is the capital of France?",
+  "List three colors.",
+  "What is 12 + 7?",
+  "Give me a JSON object with the fields name and age for Ana, who is 30.",
+  "Explain photosynthesis in one sentence.",
+  "Write a short story about a cat who learns to fly.",
+];
+const FIELDS = ["checkpoint", "loops", "temperature", "top_k", "repetition_penalty", "max_new", "seed", "system", "history", "mono"];
+
+let info = null;
+let messages = [];   // {role, content, meta?}
+let busy = false;
+let controller = null;
+
+function defaults() {
+  const d = info.defaults;
+  return { checkpoint: d.checkpoint, loops: d.loops, temperature: d.temperature, top_k: d.top_k,
+           repetition_penalty: d.repetition_penalty, max_new: d.max_new, seed: "", system: "",
+           history: false, mono: false };
+}
+
+function readForm() {
+  return {
+    checkpoint: $("checkpoint").value,
+    loops: Number($("loops").value),
+    temperature: Number($("temperature").value),
+    top_k: Math.max(0, Math.round(Number($("top_k").value) || 0)),
+    repetition_penalty: Number($("repetition_penalty").value),
+    max_new: Math.min(1024, Math.max(1, Math.round(Number($("max_new").value) || 256))),
+    seed: $("seed").value.trim(),
+    system: $("system").value,
+    history: $("history").checked,
+    mono: $("mono").checked,
+  };
+}
+
+function writeForm(s) {
+  const names = info.checkpoints.map((c) => c.name);
+  $("checkpoint").value = names.includes(s.checkpoint) ? s.checkpoint : info.defaults.checkpoint;
+  for (const f of ["loops", "temperature", "top_k", "repetition_penalty", "max_new", "seed", "system"]) $(f).value = s[f];
+  $("history").checked = !!s.history;
+  $("mono").checked = !!s.mono;
+  refreshLabels();
+}
+
+function save() { localStorage.setItem(STORE, JSON.stringify(readForm())); }
+
+function load() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(STORE) || "{}"); } catch (_) {}
+  return Object.assign(defaults(), saved);
+}
+
+function checkpointInfo(name) { return info.checkpoints.find((c) => c.name === name); }
+
+function nllAt(eval_, r) {
+  const value = eval_ && eval_.nll && eval_.nll["r" + r];
+  return typeof value === "number" ? value : null;
+}
+
+function bestNll(eval_) {
+  if (!eval_ || !eval_.nll) return null;
+  let best = null;
+  for (const [key, value] of Object.entries(eval_.nll)) {
+    const r = Number(key.slice(1));
+    if (best === null || value < best.value) best = { r, value };
+  }
+  return best;
+}
+
+function samplingLabel(s) {
+  let label = s.temperature <= 0 ? "greedy" : `t${s.temperature}` + (s.top_k > 0 ? `-k${s.top_k}` : "");
+  if (s.repetition_penalty !== 1) label += ` rep ${s.repetition_penalty}`;
+  return label;
+}
+
+function refreshLabels() {
+  const s = readForm();
+  $("loops-value").textContent = s.loops;
+  $("temperature-value").textContent = s.temperature <= 0 ? "0 (greedy)" : s.temperature.toFixed(2);
+  $("repetition_penalty-value").textContent = s.repetition_penalty.toFixed(2);
+  $("top_k").disabled = s.temperature <= 0;
+  for (const b of $("presets").children) {
+    b.classList.toggle("on", Number(b.dataset.t) === s.temperature && (s.temperature <= 0 || Number(b.dataset.k) === s.top_k));
+  }
+  const c = checkpointInfo(s.checkpoint);
+  const ev = c && c.eval;
+  let note = c && c.step != null ? `step ${c.step.toLocaleString()}` : "";
+  if (c && c.name === "pretrain") note += " · base model, not chat-tuned";
+  if (ev && ev.recommended) {
+    const rec = ev.recommended;
+    note += ` · eval: ${(rec.macro_accuracy * 100).toFixed(1)}% at r ${rec.loops} ${rec.sampling.name}`;
+  }
+  $("checkpoint-note").textContent = note;
+  const here = nllAt(ev, s.loops);
+  const best = bestNll(ev);
+  $("loops-note").textContent = here !== null
+    ? `held-out loss at r = ${s.loops}: ${here.toFixed(3)}` + (best && best.r !== s.loops ? ` (lowest ${best.value.toFixed(3)} at r = ${best.r})` : " (lowest measured)")
+    : best ? `held-out loss measured at r = ${Object.keys(ev.nll).map((k) => k.slice(1)).join(", ")}; lowest at r = ${best.r}` : "More passes of the shared core per token. Training averaged 4.";
+  for (const el of document.querySelectorAll(".assistant .bubble")) el.classList.toggle("mono", s.mono);
+}
+
+function setStatus() {
+  const s = readForm();
+  $("status").textContent = `${s.checkpoint} · r ${s.loops} · ${samplingLabel(s)} · ${info.device}`;
+}
+
+function setBusy(value) {
+  busy = value;
+  const send = $("send");
+  send.textContent = value ? "Stop" : "Send";
+  send.classList.toggle("stop", value);
+  send.type = value ? "button" : "submit";
+  $("new-chat").disabled = value;
+  $("checkpoint").disabled = value;
+}
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+function render() {
+  const box = $("messages");
+  box.replaceChildren();
+  if (!messages.length) {
+    const empty = el("div", "empty");
+    empty.append(el("h2", null, "Talk to your model"), el("div", null, "A 10M-parameter recurrent-depth model, running on this machine. Try the loop count and sampling on the right."));
+    const chips = el("div", "chips");
+    for (const text of SUGGESTIONS) {
+      const b = el("button", null, text);
+      b.type = "button";
+      b.onclick = () => send(text);
+      chips.append(b);
+    }
+    empty.append(chips);
+    box.append(empty);
+    return;
+  }
+  messages.forEach((m, i) => box.append(messageNode(m, i === messages.length - 1)));
+  scrollDown();
+}
+
+function messageNode(m, last) {
+  const wrap = el("div", "msg " + m.role);
+  const bubble = el("div", "bubble", m.content || (m.role === "assistant" ? "(no text)" : ""));
+  if (m.role === "assistant" && readForm().mono) bubble.classList.add("mono");
+  wrap.append(bubble);
+  if (m.role === "assistant" && m.meta) {
+    const meta = el("div", "meta");
+    for (const part of m.meta) meta.append(el("span", null, part));
+    if (last && !busy) {
+      const again = el("button", null, "Regenerate");
+      again.type = "button";
+      again.onclick = regenerate;
+      meta.append(again);
+    }
+    const copy = el("button", null, "Copy");
+    copy.type = "button";
+    copy.onclick = () => navigator.clipboard && navigator.clipboard.writeText(m.content);
+    meta.append(copy);
+    wrap.append(meta);
+  }
+  return wrap;
+}
+
+function scrollDown() { const log = $("log"); log.scrollTop = log.scrollHeight; }
+
+function showError(text) {
+  $("messages").append(el("div", "error", text));
+  scrollDown();
+}
+
+async function send(text) {
+  text = text.trim();
+  if (!text || busy) return;
+  messages.push({ role: "user", content: text });
+  $("input").value = "";
+  autosize();
+  render();
+  await generate();
+}
+
+async function regenerate() {
+  if (busy) return;
+  if (messages.length && messages[messages.length - 1].role === "assistant") messages.pop();
+  render();
+  await generate();
+}
+
+async function generate() {
+  const s = readForm();
+  const seed = s.seed === "" ? Math.floor(Math.random() * 2 ** 31) : Math.max(0, Math.floor(Number(s.seed) || 0));
+  const sent = s.history ? messages : messages.slice(-1);
+  const body = {
+    checkpoint: s.checkpoint, system: s.system, loops: s.loops, temperature: s.temperature,
+    top_k: s.top_k, repetition_penalty: s.repetition_penalty, max_new: s.max_new, seed,
+    messages: sent.map((m) => ({ role: m.role, content: m.content })),
+  };
+  setBusy(true);
+  const wrap = el("div", "msg assistant");
+  const bubble = el("div", "bubble live" + (s.mono ? " mono" : ""));
+  wrap.append(bubble);
+  $("messages").append(wrap);
+  scrollDown();
+
+  controller = new AbortController();
+  let start = null, done = null, text = "", error = null;
+  const clock = performance.now();
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body), signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done: finished } = await reader.read();
+      if (finished) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+        if (event.type === "start") start = event;
+        else if (event.type === "text") { text = event.text; bubble.textContent = text.trimStart(); scrollDown(); }
+        else if (event.type === "done") done = event;
+        else if (event.type === "error") throw new Error(event.message);
+      }
+    }
+  } catch (err) {
+    if (err.name !== "AbortError") error = err.message || String(err);
+  }
+  controller = null;
+  const content = (done ? done.text : text).trim();
+  if (content || done) {
+    const seconds = done ? done.seconds : (performance.now() - clock) / 1000;
+    const tokens = done ? done.tokens : null;
+    const meta = [s.checkpoint, `r ${s.loops}`, samplingLabel(s)];
+    if (tokens !== null) meta.push(`${tokens} tokens`, `${seconds.toFixed(1)} s`, `${done.tokens_per_second.toFixed(1)} tok/s`);
+    if (!done || done.stop === "cancelled") meta.push("stopped");
+    else if (done.stop === "length") meta.push("hit max tokens");
+    if (start && start.dropped_turns) meta.push(`${start.dropped_turns} old turns dropped`);
+    if (start && start.load_seconds > 0.2) meta.push(`loaded in ${start.load_seconds.toFixed(1)} s`);
+    if (s.seed === "" && s.temperature > 0) meta.push(`seed ${seed}`);
+    messages.push({ role: "assistant", content, meta });
+  }
+  setBusy(false);
+  render();
+  if (error) showError(error);
+  $("input").focus();
+}
+
+function stop() { if (controller) controller.abort(); }
+
+function autosize() {
+  const input = $("input");
+  input.style.height = "auto";
+  input.style.height = Math.min(200, input.scrollHeight + 2) + "px";
+}
+
+function wire() {
+  $("form").addEventListener("submit", (e) => { e.preventDefault(); send($("input").value); });
+  $("send").addEventListener("click", (e) => { if (busy) { e.preventDefault(); stop(); } });
+  $("input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!busy) send($("input").value); }
+  });
+  $("input").addEventListener("input", autosize);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") stop(); });
+  $("new-chat").addEventListener("click", () => { if (!busy) { messages = []; render(); $("input").focus(); } });
+  for (const f of FIELDS) {
+    $(f).addEventListener("input", () => { refreshLabels(); setStatus(); save(); });
+    $(f).addEventListener("change", () => { refreshLabels(); setStatus(); save(); });
+  }
+  for (const b of $("presets").children) {
+    b.addEventListener("click", () => {
+      $("temperature").value = b.dataset.t;
+      if (Number(b.dataset.k) > 0) $("top_k").value = b.dataset.k;
+      refreshLabels(); setStatus(); save();
+    });
+  }
+  $("reset-settings").addEventListener("click", () => { writeForm(defaults()); setStatus(); save(); });
+}
+
+async function init() {
+  try {
+    info = await (await fetch("/api/info")).json();
+  } catch (err) {
+    $("status").textContent = "cannot reach the loopmind server";
+    return;
+  }
+  const select = $("checkpoint");
+  for (const c of info.checkpoints) {
+    const option = el("option", null, c.name + (c.name === info.defaults.checkpoint ? "  (default)" : ""));
+    option.value = c.name;
+    select.append(option);
+  }
+  $("loops").max = Math.max(16, info.defaults.loops);
+  $("defaults-note").textContent = "Defaults: " + info.defaults.source + ".";
+  writeForm(load());
+  wire();
+  setStatus();
+  render();
+}
+
+init();
+</script>
+</body>
+</html>

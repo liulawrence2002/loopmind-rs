@@ -23,7 +23,9 @@ use loopmind_data::{PretrainBatch, SftBatch};
 
 use crate::batches::{pretrain_batch, sft_batch};
 use crate::config::LoopMindConfig;
-use crate::loopmind::{greedy_continue, sample_batch, sample_continue, GenerateOptions, LoopMind};
+use crate::loopmind::{
+    greedy_continue, sample_batch, sample_continue, sample_stream, GenerateOptions, LoopMind,
+};
 use crate::loss::{
     masked_shifted_logprob_rows, masked_shifted_nll_sum, shifted_token_cross_entropy,
 };
@@ -537,6 +539,19 @@ impl PretrainEngine {
         sample_continue(&self.net().valid(), ids, options, stop, &device)
     }
 
+    /// [`Self::generate`] that hands each new id to `on_token` as it is picked, and
+    /// stops early when `on_token` returns false. See [`sample_stream`].
+    pub fn generate_stream(
+        &self,
+        ids: Vec<u32>,
+        options: &GenerateOptions,
+        stop: &[u32],
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Vec<u32> {
+        let device = self.plain_device();
+        sample_stream(&self.net().valid(), ids, options, stop, &device, on_token)
+    }
+
     fn plain_device(&self) -> Device {
         self.device.clone().inner()
     }
@@ -776,6 +791,42 @@ mod tests {
             assert_eq!(&engine.generate(prompt.clone(), &options, &[]), row);
             assert_eq!(row.len(), 6);
         }
+    }
+
+    #[test]
+    fn streaming_reports_each_id_and_stops_when_asked() {
+        let engine = PretrainEngine::new(
+            &LoopMindConfig::tiny(),
+            3,
+            EngineDevice::Cpu,
+            settings(),
+            Precision::F32,
+        )
+        .unwrap();
+        let options = GenerateOptions {
+            loops: 2,
+            max_new: 6,
+            temperature: 0.8,
+            top_k: 5,
+            repetition_penalty: 1.1,
+            seed: 7,
+        };
+        let prompt = vec![1, 5, 9, 2];
+        let whole = engine.generate(prompt.clone(), &options, &[]);
+        let mut seen = Vec::new();
+        let streamed = engine.generate_stream(prompt.clone(), &options, &[], &mut |id| {
+            seen.push(id);
+            true
+        });
+        assert_eq!(streamed, whole);
+        assert_eq!(seen, whole);
+
+        let mut count = 0;
+        let cut = engine.generate_stream(prompt, &options, &[], &mut |_| {
+            count += 1;
+            count < 2
+        });
+        assert_eq!(cut, whole[..2]);
     }
 
     #[test]

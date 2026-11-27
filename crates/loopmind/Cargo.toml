@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "LoopMind command line: tokenizer, pretrain, SFT, chat, and the parameter census."
+description = "LoopMind command line: tokenizer, pretrain, SFT, chat, the local chat server, and the parameter census."
 
 [dependencies]
 clap = { workspace = true }
@@ -14,6 +14,8 @@ loopmind-data = { workspace = true }
 loopmind-model = { workspace = true }
 loopmind-tokenizer = { workspace = true }
 loopmind-train = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
 
 [features]
 default = []

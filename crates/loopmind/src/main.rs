@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod serve;
+
 use clap::{Parser, Subcommand};
 use loopmind_model::{ConfigError, GenerateOptions, LoopMindConfig};
 use loopmind_tokenizer::{ChatTurn, LoopTokenizer, Role, TrainConfig};
@@ -143,6 +145,32 @@ enum Command {
         /// Sampling seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// Path to tokenizer.json.
+        #[arg(long, default_value = "tokenizer/tokenizer.json")]
+        tokenizer: PathBuf,
+        /// `cpu`, `cuda`, or `wgpu`.
+        #[arg(long, default_value = "cpu")]
+        device: String,
+    },
+    /// Local chat page that streams answers from your checkpoints. Open the printed URL.
+    ///
+    /// Offers every run directory under --runs that has a latest.json. Starts on
+    /// runs/best.json's checkpoint, loop count, and sampling; the page changes them.
+    Serve {
+        /// Address to listen on. The default keeps the server on this machine.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Directory of run directories.
+        #[arg(long, default_value = "runs")]
+        runs: PathBuf,
+        /// Run name to start on, such as `sft`. Default: runs/best.json, else `sft`.
+        #[arg(long)]
+        checkpoint: Option<String>,
+        /// Default new tokens per answer.
+        #[arg(long, default_value_t = 256)]
+        max_new: usize,
         /// Path to tokenizer.json.
         #[arg(long, default_value = "tokenizer/tokenizer.json")]
         tokenizer: PathBuf,
@@ -521,6 +549,89 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 None => chat.repl()?,
             }
         }
+        Command::Serve {
+            host,
+            port,
+            runs,
+            checkpoint,
+            max_new,
+            tokenizer,
+            device,
+        } => {
+            let runs = find_dir(runs)?;
+            let checkpoints = serve::discover(&runs);
+            let names: Vec<&str> = checkpoints.iter().map(|c| c.name.as_str()).collect();
+            if names.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "no run directories with a latest.json under {}",
+                    runs.display()
+                ))
+                .into());
+            }
+            let best_path = runs.join("best.json");
+            let best = if best_path.is_file() {
+                Some(loopmind_train::BestModel::read(&best_path)?)
+            } else {
+                None
+            };
+            let best_name = best
+                .as_ref()
+                .and_then(|best| best.checkpoint.file_name()?.to_str().map(str::to_string))
+                .filter(|name| names.contains(&name.as_str()));
+            let start = match checkpoint {
+                Some(name) if names.contains(&name.as_str()) => name,
+                Some(name) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "no run named {name:?} under {}; found {}",
+                        runs.display(),
+                        names.join(", ")
+                    ))
+                    .into())
+                }
+                None => best_name
+                    .clone()
+                    .or_else(|| names.contains(&"sft").then(|| "sft".to_string()))
+                    .unwrap_or_else(|| names[0].to_string()),
+            };
+            let from_best = best.filter(|_| best_name.as_deref() == Some(start.as_str()));
+            let defaults = serve::Defaults {
+                checkpoint: start,
+                loops: from_best.as_ref().map_or(4, |best| best.loops),
+                temperature: from_best
+                    .as_ref()
+                    .map_or(0.7, |best| best.sampling.temperature),
+                top_k: from_best.as_ref().map_or(40, |best| best.sampling.top_k),
+                repetition_penalty: from_best
+                    .as_ref()
+                    .map_or(1.1, |best| best.sampling.repetition_penalty),
+                max_new,
+                source: match &from_best {
+                    Some(best) => format!("runs/best.json, {}", best.reason),
+                    None => "r 4, t0.7-k40, repetition penalty 1.1".to_string(),
+                },
+            };
+            let tokenizer = LoopTokenizer::from_file(&find_file(tokenizer)?)?;
+            let special = |name: &str| {
+                tokenizer
+                    .token_id(name)
+                    .ok_or_else(|| ConfigError::Invalid(format!("tokenizer is missing {name}")))
+            };
+            let stop = [
+                special(loopmind_tokenizer::IM_END)?,
+                special(loopmind_tokenizer::EOS)?,
+            ];
+            serve::serve(
+                serve::ServeOptions {
+                    host,
+                    port,
+                    device,
+                    checkpoints,
+                    defaults,
+                },
+                tokenizer,
+                stop,
+            )?;
+        }
         Command::Eval {
             checkpoint,
             out,
@@ -727,21 +838,14 @@ struct Chat<'a> {
 impl Chat<'_> {
     fn respond(&mut self, user: String) -> Result<String, Box<dyn std::error::Error>> {
         self.history.push(ChatTurn::new(Role::User, user));
-        let mut prompt = self.tokenizer.render_chat(&self.history, true)?;
         // Drop the oldest non-system turns until the prompt leaves room for the answer.
-        while prompt.ids.len() + self.options.max_new > self.context {
-            let first = usize::from(
-                self.history
-                    .first()
-                    .is_some_and(|turn| turn.role == Role::System),
-            );
-            if self.history.len() <= first + 1 {
-                break;
-            }
-            self.history.remove(first);
-            prompt = self.tokenizer.render_chat(&self.history, true)?;
-        }
-        let ids = self.engine.generate(prompt.ids, &self.options, &self.stop);
+        let (prompt, _) = serve::fit_prompt(
+            self.tokenizer,
+            &mut self.history,
+            self.options.max_new,
+            self.context,
+        )?;
+        let ids = self.engine.generate(prompt, &self.options, &self.stop);
         self.options.seed = self.options.seed.wrapping_add(1);
         let text = self.tokenizer.decode(&ids)?.trim().to_string();
         self.history

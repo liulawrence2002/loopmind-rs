@@ -82,7 +82,7 @@ SFT uses English chat rows of `KeremTT/FABLE-5.2-MAX-DATABASE`. Rows over 1024 t
 | `loopmind-tokenizer` | Byte-level BPE, chat template, and assistant loss mask. |
 | `loopmind-data` | Pretrain and SFT shard builder, plus the batch sampler. No Burn dependency. |
 | `loopmind-train` | Pretrain and SFT drivers (M4, M5). Depends on the model crate, not on Burn. |
-| `loopmind` | `clap` CLI. |
+| `loopmind` | `clap` CLI, and the local chat server (`serve`). |
 
 Burn 0.22.1 is the framework. The default build enables the pure-Rust `flex` CPU backend, which is what CI runs. `wgpu` and `cuda` are feature flags on `loopmind` and `loopmind-model`:
 
@@ -112,6 +112,7 @@ cargo run -p loopmind --release --features cuda -- sft --config configs/sft.toml
 cargo run -p loopmind --release --features cuda -- chat --checkpoint runs/sft --device cuda
 DEVICE=cuda scripts/refine.sh   # eval, loop-dial tuning, refine pass, self-generated DPO
 cargo run -p loopmind --release --features cuda -- chat --device cuda   # uses runs/best.json
+cargo run -p loopmind --release --features cuda -- serve --device cuda  # chat page at http://127.0.0.1:8080
 ```
 
 Train and use the tokenizer:

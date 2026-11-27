@@ -90,3 +90,30 @@ Without `--prompt`, `chat` reads one user turn per line from stdin. `/reset` cle
 | `--system` | none | optional system turn |
 
 There is no KV cache. Each new token reruns the window, which at r = 4 is fine for a 10M model.
+
+## Chat in the browser
+
+```bash
+cargo build --release -p loopmind --features cuda
+./target/release/loopmind serve --device cuda          # then open http://127.0.0.1:8080
+```
+
+`serve` runs a local chat page on this repo's inference code. Nothing goes to an outside service. It offers every run directory under `runs/` that has a `latest.json`, and it starts on the checkpoint, loop count, and sampling in `runs/best.json`. You can change these on the page:
+
+- the checkpoint;
+- the loop count `r`;
+- the temperature, or a preset: greedy, `t0.3-k20`, or `t0.7-k40`;
+- top-k, the repetition penalty, max tokens, and the seed;
+- a system message.
+
+When `runs/eval/<run>.json` exists, the page shows that checkpoint's eval accuracy and its held-out loss at the chosen `r`. The text streams token by token. Esc or Stop ends an answer early, and the server stops generating for it. Settings are kept in the browser's local storage.
+
+**Send earlier turns** is off by default, so each message is answered on its own. The SFT data is single-turn: all 2,000 held-out rows have one user turn. With an earlier exchange in context, the model tends to copy its previous answer. Turn the setting on to test multi-turn chat. When it is on, the oldest turns are dropped, as in `chat`, once the prompt plus max tokens would pass the 1024-token context.
+
+On the 4070, with no KV cache, answers stream at about 24–35 tokens/s at r = 4 or 8, once the first answer has compiled the kernels. The server listens on 127.0.0.1 and refuses requests whose `Host` is not a local name. `--host 0.0.0.0` opens it to the network and turns that check off. One worker thread holds one checkpoint and answers one request at a time. Switching checkpoints reloads the weights, which takes about a second.
+
+| Endpoint | |
+| --- | --- |
+| `GET /` | the page |
+| `GET /api/info` | checkpoints, their eval summaries, and the starting settings |
+| `POST /api/chat` | `{checkpoint, messages: [{role, content}], system, loops, temperature, top_k, repetition_penalty, max_new, seed}`. Streams NDJSON: one `start` event, then a `text` event per token with the full text so far, then `done` with the final text, token count, speed, and why it stopped (`end`, `length`, or `cancelled`). Errors are an `error` event. |

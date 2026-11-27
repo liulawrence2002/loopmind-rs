@@ -460,6 +460,23 @@ pub fn sample_continue(
         .unwrap_or_default()
 }
 
+/// [`sample_continue`] that hands each new id to `on_token` as soon as it is picked.
+/// Generation ends early when `on_token` returns false; the ids so far are returned.
+pub fn sample_stream(
+    model: &LoopMind,
+    ids: Vec<u32>,
+    options: &GenerateOptions,
+    stop: &[u32],
+    device: &burn::tensor::Device,
+    on_token: &mut dyn FnMut(u32) -> bool,
+) -> Vec<u32> {
+    sample_rows(model, &[ids], options, stop, device, &mut |_, id| {
+        on_token(id)
+    })
+    .pop()
+    .unwrap_or_default()
+}
+
 /// Sampled continuations of prompts that all have the same length, in one batch.
 ///
 /// There is no KV cache, so each step reruns the window. Equal lengths need no
@@ -472,6 +489,19 @@ pub fn sample_batch(
     options: &GenerateOptions,
     stop: &[u32],
     device: &burn::tensor::Device,
+) -> Vec<Vec<u32>> {
+    sample_rows(model, prompts, options, stop, device, &mut |_, _| true)
+}
+
+/// [`sample_batch`] with a callback for each new id of row `i`. The whole batch stops
+/// after the step in which the callback returns false.
+fn sample_rows(
+    model: &LoopMind,
+    prompts: &[Vec<u32>],
+    options: &GenerateOptions,
+    stop: &[u32],
+    device: &burn::tensor::Device,
+    on_token: &mut dyn FnMut(usize, u32) -> bool,
 ) -> Vec<Vec<u32>> {
     let Some(first) = prompts.first() else {
         return Vec::new();
@@ -511,6 +541,7 @@ pub fn sample_batch(
             .try_into_vec()
             .expect("logits are f32");
         let mut still = Vec::with_capacity(active.len());
+        let mut keep_going = true;
         for (slot, row) in active.iter().enumerate() {
             let mut row_logits = logits[slot * vocab..(slot + 1) * vocab].to_vec();
             penalize_repeats(
@@ -525,8 +556,12 @@ pub fn sample_batch(
             rows[*row].push(next);
             produced[*row].push(next);
             still.push(*row);
+            keep_going &= on_token(*row, next);
         }
         active = still;
+        if !keep_going {
+            break;
+        }
     }
     produced
 }

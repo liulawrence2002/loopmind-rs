@@ -36,8 +36,8 @@ pub use engine::{
 };
 pub use framework::{compiled_backends, framework_name};
 pub use loopmind::{
-    export_parity_fixture, greedy_continue, sample_batch, sample_continue, ForwardOutput,
-    GenerateOptions, LoopMind,
+    export_parity_fixture, greedy_continue, sample_batch, sample_continue, sample_stream,
+    ForwardOutput, GenerateOptions, LoopMind,
 };
 pub use loss::{
     masked_shifted_logprob_rows, masked_shifted_nll_sum, shifted_token_cross_entropy,

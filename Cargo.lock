@@ -4109,6 +4109,8 @@ dependencies = [
  "loopmind-model",
  "loopmind-tokenizer",
  "loopmind-train",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
