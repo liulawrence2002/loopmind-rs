@@ -197,7 +197,7 @@ impl Mixture {
         &self,
         x: Tensor<3>,
         force_routes: Option<Tensor<3, Int>>,
-    ) -> (Tensor<3>, Tensor<1>) {
+    ) -> (Tensor<3>, Tensor<1>, Tensor<1>) {
         let [batch, seq, d_model] = x.dims();
         let tokens = batch * seq;
         let flat = x.reshape([tokens, d_model]);
@@ -221,8 +221,9 @@ impl Mixture {
             let column = gates.clone().narrow(1, expert_id, 1);
             mixed = mixed + expert.forward(flat.clone()) * column;
         }
-        let aux = balance_loss(&probs, &indices, n_experts, self.top_k);
-        (mixed.reshape([batch, seq, d_model]), aux)
+        let slots = slot_fraction(&indices, n_experts, self.top_k);
+        let aux = balance_loss(&probs, &slots, n_experts);
+        (mixed.reshape([batch, seq, d_model]), aux, slots)
     }
 }
 
@@ -234,19 +235,17 @@ fn route_gates(indices: &Tensor<2, Int>, weights: &Tensor<2>, n_experts: usize) 
     weighted.sum_dim(1).reshape([tokens, n_experts])
 }
 
-/// `n_experts * sum_i f_i P_i`, where `f` is the fraction of top-k slots and `P` is the mean router probability.
-fn balance_loss(
-    probs: &Tensor<2>,
-    indices: &Tensor<2, Int>,
-    n_experts: usize,
-    top_k: usize,
-) -> Tensor<1> {
-    let tokens = probs.dims()[0] as f32;
+/// Fraction of top-k slots assigned to each expert.
+fn slot_fraction(indices: &Tensor<2, Int>, n_experts: usize, top_k: usize) -> Tensor<1> {
+    let tokens = indices.dims()[0] as f32;
     let assignment = indices.clone().float().one_hot::<3>(n_experts);
-    let slot_fraction =
-        assignment.sum_dim(1).sum_dim(0).reshape([n_experts]) / (tokens * top_k as f32);
+    assignment.sum_dim(1).sum_dim(0).reshape([n_experts]) / (tokens * top_k as f32)
+}
+
+/// `n_experts * sum_i f_i P_i`, where `f` is the fraction of top-k slots and `P` is the mean router probability.
+fn balance_loss(probs: &Tensor<2>, slot_fraction: &Tensor<1>, n_experts: usize) -> Tensor<1> {
     let mean_prob = probs.clone().mean_dim(0).reshape([n_experts]);
-    (slot_fraction * mean_prob).sum() * (n_experts as f32)
+    (slot_fraction.clone() * mean_prob).sum() * (n_experts as f32)
 }
 
 /// Pre-norm transformer layer with a dense SwiGLU.
@@ -297,11 +296,11 @@ impl MoeBlock {
         &self,
         x: Tensor<3>,
         force_routes: Option<Tensor<3, Int>>,
-    ) -> (Tensor<3>, Tensor<1>) {
+    ) -> (Tensor<3>, Tensor<1>, Tensor<1>) {
         let x = x.clone() + self.attn.forward(self.attn_norm.forward(x));
-        let (ffn_out, aux) = self
+        let (ffn_out, aux, slots) = self
             .moe
             .forward(self.ffn_norm.forward(x.clone()), force_routes);
-        (x + ffn_out, aux)
+        (x + ffn_out, aux, slots)
     }
 }

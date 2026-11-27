@@ -10,12 +10,20 @@ impl TrainRng {
     /// Seed the generator. A zero seed is replaced so the state does not stick at zero.
     pub fn new(seed: u64) -> Self {
         Self {
-            state: if seed == 0 {
-                0x9E37_79B9_7F4A_7C15
-            } else {
-                seed
-            },
+            state: nonzero(seed),
         }
+    }
+
+    /// Restore a checkpointed generator.
+    pub fn from_state(state: u64) -> Self {
+        Self {
+            state: nonzero(state),
+        }
+    }
+
+    /// State to store in a checkpoint.
+    pub fn state(&self) -> u64 {
+        self.state
     }
 
     /// Poisson(`mean`) clamped to `1..=max`.
@@ -45,5 +53,13 @@ impl TrainRng {
         self.state = x;
         let bits = x >> 11;
         (bits as f64 + 0.5) / ((1u64 << 53) as f64)
+    }
+}
+
+fn nonzero(state: u64) -> u64 {
+    if state == 0 {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        state
     }
 }

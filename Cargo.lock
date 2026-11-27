@@ -4144,6 +4144,13 @@ dependencies = [
 [[package]]
 name = "loopmind-train"
 version = "0.1.0"
+dependencies = [
+ "loopmind-data",
+ "loopmind-model",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+]
 
 [[package]]
 name = "macerator"

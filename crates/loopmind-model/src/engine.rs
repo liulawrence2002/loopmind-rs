@@ -1,0 +1,394 @@
+//! One pretrain step: sampled loops, shifted cross-entropy, aux loss, AdamW.
+//!
+//! Weight decay is not applied to embeddings or RMSNorm scales. Gradients are
+//! clipped by their global L2 norm. CPU and wgpu stay in f32. A CUDA build
+//! tries bf16, then f16, and stays on f32 if that matmul does not return
+//! finite values. The stored weights use that dtype; Burn updates them in
+//! place, so there is no separate f32 master copy.
+
+use std::path::Path;
+use std::sync::Mutex;
+
+/// Burn's flex RNG is process-global. Seed and initialization must not interleave
+/// with another run, or two engines with the same seed diverge.
+static INIT_RNG: Mutex<()> = Mutex::new(());
+
+use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
+use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams};
+use burn::tensor::{DType, Device, Tensor};
+use loopmind_data::PretrainBatch;
+
+use crate::batches::pretrain_batch;
+use crate::config::LoopMindConfig;
+use crate::loopmind::{greedy_continue, LoopMind};
+use crate::loss::shifted_token_cross_entropy;
+use crate::rng::TrainRng;
+
+/// Where the run executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineDevice {
+    Cpu,
+    Cuda,
+    Wgpu,
+}
+
+impl EngineDevice {
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => Ok(Self::Cuda),
+            "wgpu" => Ok(Self::Wgpu),
+            other => Err(format!("unknown device {other}; use cpu, cuda, or wgpu")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Wgpu => "wgpu",
+        }
+    }
+}
+
+/// AdamW settings that are not the learning rate. The schedule lives with the run.
+#[derive(Debug, Clone, Copy)]
+pub struct OptimSettings {
+    pub weight_decay: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub epsilon: f32,
+    pub grad_clip: f32,
+}
+
+/// Result of one microbatch backward.
+#[derive(Debug, Clone)]
+pub struct MicroStats {
+    pub loss: f32,
+    pub aux: f32,
+    pub loops: Vec<usize>,
+    pub expert_slots: Vec<Vec<f32>>,
+    pub tokens: u64,
+}
+
+/// Result of the optimizer step that consumes accumulated gradients.
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyStats {
+    pub grad_norm: f32,
+}
+
+pub struct PretrainEngine {
+    model: Option<LoopMind>,
+    optim: burn::optim::ModuleOptimizer,
+    accumulator: GradientsAccumulator<LoopMind>,
+    pending: u32,
+    rng: TrainRng,
+    device: Device,
+    precision: String,
+    kind: EngineDevice,
+    grad_clip: f32,
+}
+
+impl PretrainEngine {
+    pub fn new(
+        config: &LoopMindConfig,
+        seed: u64,
+        kind: EngineDevice,
+        settings: OptimSettings,
+    ) -> Result<Self, String> {
+        let device = burn_device(kind)?;
+        let _guard = INIT_RNG.lock().expect("init rng lock");
+        device.seed(seed);
+        let mut model = LoopMind::init(config, &device);
+        drop(_guard);
+        let precision = resolve_precision(kind, &device).to_string();
+        if let Some(dtype) = dtype_of(&precision) {
+            model = cast_parameters(model, dtype);
+        }
+        Ok(Self {
+            optim: adamw(settings),
+            accumulator: GradientsAccumulator::new(),
+            pending: 0,
+            rng: TrainRng::new(seed ^ 0xD1CE_5EED),
+            model: Some(model),
+            device,
+            precision,
+            kind,
+            grad_clip: settings.grad_clip,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        config: &LoopMindConfig,
+        seed: u64,
+        kind: EngineDevice,
+        settings: OptimSettings,
+        model_path: &Path,
+        optim_path: &Path,
+        rng_state: u64,
+        precision: String,
+    ) -> Result<Self, String> {
+        let device = burn_device(kind)?;
+        let _guard = INIT_RNG.lock().expect("init rng lock");
+        device.seed(seed);
+        let model = LoopMind::init(config, &device)
+            .try_load_file(model_path)
+            .map_err(|error| error.to_string())?;
+        drop(_guard);
+        let optim = adamw(settings)
+            .load(optim_path)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            model: Some(model),
+            optim,
+            accumulator: GradientsAccumulator::new(),
+            pending: 0,
+            rng: TrainRng::from_state(rng_state),
+            device,
+            precision,
+            kind,
+            grad_clip: settings.grad_clip,
+        })
+    }
+
+    pub fn precision(&self) -> &str {
+        &self.precision
+    }
+
+    pub fn device_name(&self) -> &'static str {
+        self.kind.name()
+    }
+
+    pub fn config(&self) -> &LoopMindConfig {
+        &self.net().config
+    }
+
+    fn net(&self) -> &LoopMind {
+        self.model.as_ref().expect("model is loaded")
+    }
+
+    pub fn rng_state(&self) -> u64 {
+        self.rng.state()
+    }
+
+    pub fn set_rng_state(&mut self, state: u64) {
+        self.rng = TrainRng::from_state(state);
+    }
+
+    pub fn accumulate(&mut self, batch: &PretrainBatch) -> Result<MicroStats, String> {
+        if batch.seq_len < 2 {
+            return Err("a packed sequence needs at least 2 tokens".into());
+        }
+        let tokens = pretrain_batch(batch, &self.device);
+        let mut rng = self.rng.clone();
+        let model = self.model.as_ref().expect("model is loaded");
+        let out = model.forward_sampled(tokens.clone(), &mut rng);
+        self.rng = rng;
+        let aux = out.aux_loss.clone();
+        let loss = shifted_token_cross_entropy(out.logits, tokens) + aux.clone();
+        let loss_value = loss.clone().into_scalar::<f32>();
+        let aux_value = aux.into_scalar::<f32>();
+        if !loss_value.is_finite() {
+            return Err("pretrain loss is not finite".into());
+        }
+        let mut grads = GradientsParams::from_grads(loss.backward(), self.net());
+        detach_grads(self.net(), &mut grads);
+        let model = self.model.take().expect("model is loaded");
+        self.accumulator.accumulate(&model, grads);
+        self.model = Some(model);
+        self.pending += 1;
+        Ok(MicroStats {
+            loss: loss_value,
+            aux: aux_value,
+            loops: out.loops,
+            expert_slots: out.expert_slots,
+            tokens: (batch.batch * batch.seq_len) as u64,
+        })
+    }
+
+    pub fn apply(&mut self, learning_rate: f64) -> Result<ApplyStats, String> {
+        if self.pending == 0 {
+            return Err("no gradients to apply".into());
+        }
+        let scale = 1.0 / self.pending as f32;
+        let mut grads = self.accumulator.grads();
+        scale_grads(self.net(), &mut grads, scale);
+        let grad_norm = grad_norm(self.net(), &grads);
+        let clip = self.grad_clip;
+        if clip > 0.0 && grad_norm > clip {
+            scale_grads(self.net(), &mut grads, clip / grad_norm);
+        }
+        let model = self.model.take().expect("model is loaded");
+        self.model = Some(self.optim.step(learning_rate, model, grads));
+        self.pending = 0;
+        Ok(ApplyStats { grad_norm })
+    }
+
+    pub fn validate(&self, batch: &PretrainBatch, loops: usize) -> Result<f32, String> {
+        let tokens = pretrain_batch(batch, &self.device);
+        let out = self.net().forward(tokens.clone(), loops);
+        let loss = shifted_token_cross_entropy(out.logits, tokens);
+        Ok(loss.into_scalar::<f32>())
+    }
+
+    pub fn greedy(&self, ids: Vec<u32>, loops: usize, max_new: usize, eos: u32) -> Vec<u32> {
+        greedy_continue(self.net(), ids, loops, max_new, eos, &self.device)
+    }
+
+    pub fn save(&self, model_path: &Path, optim_path: &Path) -> Result<(), String> {
+        if let Some(parent) = model_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        self.net()
+            .clone()
+            .save_file(model_path)
+            .map_err(|error| error.to_string())?;
+        self.optim
+            .save(optim_path)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+fn adamw(settings: OptimSettings) -> burn::optim::ModuleOptimizer {
+    let decay = AdamWConfig::new()
+        .with_beta_1(settings.beta1)
+        .with_beta_2(settings.beta2)
+        .with_epsilon(settings.epsilon)
+        .with_weight_decay(settings.weight_decay)
+        .init();
+    let frozen_decay = AdamWConfig::new()
+        .with_beta_1(settings.beta1)
+        .with_beta_2(settings.beta2)
+        .with_epsilon(settings.epsilon)
+        .with_weight_decay(0.0)
+        .build();
+    let group = burn::module::ParamGroup::from_any_predicates(vec![
+        "embed".to_string(),
+        "norm".to_string(),
+    ]);
+    decay.with_group(group, frozen_decay, None)
+}
+
+fn burn_device(kind: EngineDevice) -> Result<Device, String> {
+    match kind {
+        EngineDevice::Cpu => Ok(Device::flex().autodiff()),
+        EngineDevice::Cuda => cuda_device(),
+        EngineDevice::Wgpu => wgpu_device(),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_device() -> Result<Device, String> {
+    Ok(Device::cuda(0).autodiff())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_device() -> Result<Device, String> {
+    Err("this binary has no CUDA backend; rebuild with --features cuda".into())
+}
+
+#[cfg(feature = "wgpu")]
+fn wgpu_device() -> Result<Device, String> {
+    Ok(Device::wgpu(burn::tensor::DeviceKind::DefaultDevice).autodiff())
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn wgpu_device() -> Result<Device, String> {
+    Err("this binary has no wgpu backend; rebuild with --features wgpu".into())
+}
+
+fn resolve_precision(kind: EngineDevice, device: &Device) -> &'static str {
+    if kind != EngineDevice::Cuda {
+        return "f32";
+    }
+    if probe(device, DType::BF16) {
+        "bf16"
+    } else if probe(device, DType::F16) {
+        "f16"
+    } else {
+        "f32"
+    }
+}
+
+fn dtype_of(precision: &str) -> Option<DType> {
+    match precision {
+        "bf16" => Some(DType::BF16),
+        "f16" => Some(DType::F16),
+        _ => None,
+    }
+}
+
+fn probe(device: &Device, dtype: DType) -> bool {
+    let left = Tensor::<2>::ones([8, 8], device).cast(dtype);
+    let value = left.clone().matmul(left).cast(DType::F32);
+    value
+        .into_data()
+        .try_into_vec::<f32>()
+        .map(|items| items.iter().all(|item| item.is_finite()))
+        .unwrap_or(false)
+}
+
+fn cast_parameters(model: LoopMind, dtype: DType) -> LoopMind {
+    struct Cast(DType);
+    impl ModuleMapper for Cast {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
+            let updated = param.val().cast(self.0).detach().require_grad();
+            param.map(|_| updated)
+        }
+    }
+    model.map(&mut Cast(dtype))
+}
+
+fn grad_norm(model: &LoopMind, grads: &GradientsParams) -> f32 {
+    struct Norm<'a> {
+        grads: &'a GradientsParams,
+        sum: f64,
+    }
+    impl ModuleVisitor for Norm<'_> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            let Some(grad) = self.grads.get::<D>(param.id) else {
+                return;
+            };
+            let square = grad.powf_scalar(2.0).sum().into_scalar::<f32>();
+            self.sum += f64::from(square);
+        }
+    }
+    let mut norm = Norm { grads, sum: 0.0 };
+    model.visit(&mut norm);
+    norm.sum.sqrt() as f32
+}
+
+fn detach_grads(model: &LoopMind, grads: &mut GradientsParams) {
+    struct Detach<'a> {
+        grads: &'a mut GradientsParams,
+    }
+    impl ModuleVisitor for Detach<'_> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            let Some(grad) = self.grads.remove::<D>(param.id) else {
+                return;
+            };
+            self.grads.register(param.id, grad.detach());
+        }
+    }
+    let mut detach = Detach { grads };
+    model.visit(&mut detach);
+}
+
+fn scale_grads(model: &LoopMind, grads: &mut GradientsParams, scale: f32) {
+    struct Scale<'a> {
+        grads: &'a mut GradientsParams,
+        scale: f32,
+    }
+    impl ModuleVisitor for Scale<'_> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            let Some(grad) = self.grads.remove::<D>(param.id) else {
+                return;
+            };
+            self.grads.register(param.id, grad.mul_scalar(self.scale));
+        }
+    }
+    let mut scale = Scale { grads, scale };
+    model.visit(&mut scale);
+}

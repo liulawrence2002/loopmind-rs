@@ -1,0 +1,39 @@
+# One epoch of the 50M-token mix, sized for an RTX 4070 Laptop (8 GB).
+# Sequence length comes from the shards (1024). micro_batch 1 and 8192 tokens/step
+# is 8 gradient-accumulation sequences. Prepare is CPU-only; this loop is the GPU job.
+#
+# peak_tflops is the dense FP32 peak used for the MFU estimate (4070 Laptop, about 15).
+# A bf16 CUDA run is still reported against this peak, so the percentage is conservative.
+
+model = "configs/default.toml"
+data_dir = "data/prepared/pretrain"
+run_dir = "runs/pretrain"
+seed = 42
+epochs = 1
+max_steps = 0
+device = "cpu"
+peak_tflops = 15.0
+val_loops = [1, 2, 4, 8]
+
+[optim]
+learning_rate = 3.0e-4
+min_learning_rate = 3.0e-5
+weight_decay = 0.1
+beta1 = 0.9
+beta2 = 0.95
+epsilon = 1.0e-8
+grad_clip = 1.0
+warmup_steps = 100
+
+[batch]
+micro_batch = 1
+tokens_per_step = 8192
+
+[log]
+every = 1
+val_every = 200
+val_sequences = 16
+
+[checkpoint]
+every = 200
+keep = 2

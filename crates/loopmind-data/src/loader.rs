@@ -32,10 +32,30 @@ struct ShardLoc {
     seq_len: usize,
 }
 
+/// Position in a shuffled epoch. The permutation is `seed` mixed with `epoch`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EpochCursor {
+    pub epoch: u64,
+    pub index: u64,
+    pub seed: u64,
+}
+
+impl EpochCursor {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            epoch: 0,
+            index: 0,
+            seed,
+        }
+    }
+}
+
 pub struct PretrainLoader {
     shards: Vec<ShardLoc>,
     total: u64,
     rng: Rng,
+    order_key: Option<(u64, u64)>,
+    order: Vec<u32>,
 }
 
 impl PretrainLoader {
@@ -69,6 +89,8 @@ impl PretrainLoader {
             shards,
             total,
             rng: Rng::new(seed),
+            order_key: None,
+            order: Vec::new(),
         })
     }
 
@@ -76,8 +98,71 @@ impl PretrainLoader {
         self.total
     }
 
+    pub fn seq_len(&self) -> usize {
+        self.shards[0].seq_len
+    }
+
     pub fn is_empty(&self) -> bool {
         self.total == 0
+    }
+
+    /// Next `batch` packed sequences in epoch order.
+    ///
+    /// The batch is always full when the corpus is non-empty. Crossing the end of an
+    /// epoch continues into the next shuffle inside the same batch.
+    pub fn next_batch(
+        &mut self,
+        batch: usize,
+        cursor: &mut EpochCursor,
+    ) -> Result<PretrainBatch, DataError> {
+        if batch == 0 {
+            return Err(DataError::new("batch size must be greater than 0"));
+        }
+        if self.total == 0 {
+            return Err(DataError::new("pretrain loader is empty"));
+        }
+        let seq_len = self.shards[0].seq_len;
+        let mut tokens = Vec::with_capacity(batch * seq_len);
+        let mut filled = 0usize;
+        while filled < batch {
+            self.ensure_order(cursor);
+            if cursor.index >= self.order.len() as u64 {
+                cursor.epoch += 1;
+                cursor.index = 0;
+                self.order_key = None;
+                continue;
+            }
+            let sequence = self.read_sequence(u64::from(self.order[cursor.index as usize]))?;
+            if sequence.len() != seq_len {
+                return Err(DataError::new(
+                    "pretrain shards disagree on sequence length",
+                ));
+            }
+            tokens.extend(sequence);
+            cursor.index += 1;
+            filled += 1;
+            if cursor.index >= self.order.len() as u64 && filled < batch {
+                cursor.epoch += 1;
+                cursor.index = 0;
+                self.order_key = None;
+            }
+        }
+        Ok(PretrainBatch {
+            tokens,
+            batch: filled,
+            seq_len,
+        })
+    }
+
+    fn ensure_order(&mut self, cursor: &EpochCursor) {
+        let key = (cursor.seed, cursor.epoch);
+        if self.order_key == Some(key) {
+            return;
+        }
+        let n = u32::try_from(self.total).unwrap_or(u32::MAX);
+        let n = n.min(self.total as u32);
+        self.order = permutation(n, mix_epoch(cursor.seed, cursor.epoch));
+        self.order_key = Some(key);
     }
 
     pub fn sample(&mut self, batch: usize) -> Result<PretrainBatch, DataError> {
@@ -207,6 +292,23 @@ fn bucket_width(len: usize) -> usize {
         .unwrap_or(len)
 }
 
+fn mix_epoch(seed: u64, epoch: u64) -> u64 {
+    seed ^ epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_A5A5_A5A5_A5A5
+}
+
+fn permutation(n: u32, seed: u64) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..n).collect();
+    if n <= 1 {
+        return order;
+    }
+    let mut rng = Rng::new(seed);
+    for i in (1..n).rev() {
+        let j = (rng.next() % u64::from(i + 1)) as usize;
+        order.swap(i as usize, j);
+    }
+    order
+}
+
 struct Rng(u64);
 
 impl Rng {
@@ -249,6 +351,30 @@ mod tests {
         assert_eq!(batch.tokens.len(), 16);
         assert_eq!(batch.tokens, right.sample(4).unwrap().tokens);
         assert_eq!(left.len(), 5);
+    }
+
+    #[test]
+    fn epoch_cursor_is_deterministic_and_wraps() {
+        let dir = std::env::temp_dir().join(format!("loopmind-epoch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let sequences: Vec<Vec<u16>> = (0..5).map(|row| vec![row, 1, 2, 3]).collect();
+        write_pretrain_shard(&dir.join("a.bin"), 4, &sequences).unwrap();
+        let mut loader = PretrainLoader::from_dir(&dir, 1).unwrap();
+        let mut cursor = EpochCursor::new(9);
+        let first = loader.next_batch(2, &mut cursor).unwrap();
+        assert_eq!(cursor.epoch, 0);
+        assert_eq!(cursor.index, 2);
+        let mut again = PretrainLoader::from_dir(&dir, 1).unwrap();
+        let mut restarted = EpochCursor::new(9);
+        assert_eq!(
+            again.next_batch(2, &mut restarted).unwrap().tokens,
+            first.tokens
+        );
+        loader.next_batch(2, &mut cursor).unwrap();
+        loader.next_batch(2, &mut cursor).unwrap();
+        assert_eq!(cursor.epoch, 1);
+        assert_eq!(cursor.index, 1);
     }
 
     #[test]
