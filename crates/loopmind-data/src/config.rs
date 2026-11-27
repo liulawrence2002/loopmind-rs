@@ -25,6 +25,10 @@ pub struct Revisions {
     pub cosmopedia: String,
     pub tinystories: String,
     pub fable: String,
+    /// Commit of `jingyaogong/minimind_dataset`, for `sft.minimind_file`. Left out of
+    /// the build fingerprint when unset, so configs without it keep their builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -40,6 +44,11 @@ pub struct SftConfig {
     pub max_tokens: usize,
     pub eval_rows: usize,
     pub exclude_cc_by_sa: bool,
+    /// Local path of a MiniMind SFT file (`sft_t2t_mini.jsonl` or `sft_t2t.jsonl`).
+    /// Downloaded from `jingyaogong/minimind_dataset` at `revisions.minimind` when it is
+    /// missing. Its English rows are added to the SFT train split after FABLE's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimind_file: Option<PathBuf>,
 }
 
 impl DataConfig {
@@ -75,6 +84,11 @@ impl DataConfig {
         if self.sft.max_tokens == 0 || self.sft.eval_rows == 0 {
             return Err(DataError::new("sft limits must be greater than 0"));
         }
+        if self.sft.minimind_file.is_some() && self.revisions.minimind.is_none() {
+            return Err(DataError::new(
+                "sft.minimind_file needs revisions.minimind (a dataset commit)",
+            ));
+        }
         Ok(())
     }
 
@@ -94,6 +108,11 @@ impl DataConfig {
             "tinystories" => self.revisions.tinystories.as_str(),
             "fable-wiki" => self.revisions.fable.as_str(),
             "fable" => self.revisions.fable.as_str(),
+            "minimind" => self
+                .revisions
+                .minimind
+                .as_deref()
+                .ok_or_else(|| DataError::new("revisions.minimind is not set"))?,
             _ => return Err(DataError::new(format!("unknown source {source}"))),
         })
     }
@@ -116,10 +135,28 @@ mod tests {
         assert_eq!(config.sft.max_tokens, 1_024);
         assert_eq!(config.sft.eval_rows, 2_000);
         assert!(!config.sft.exclude_cc_by_sa);
+        assert_eq!(config.revision("minimind").unwrap().len(), 40);
+        assert!(config
+            .sft
+            .minimind_file
+            .as_ref()
+            .is_some_and(|file| file.ends_with("sft_t2t_mini.jsonl")));
         assert_eq!(
             config.pretrain_budgets().map(|(_, tokens)| tokens),
             [25_000_000, 10_000_000, 10_000_000, 5_000_000]
         );
         assert_eq!(config.revision("fineweb").unwrap().len(), 40);
+    }
+
+    #[test]
+    fn minimind_is_optional_and_left_out_of_the_fingerprint_when_unset() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/data.toml");
+        let mut config = DataConfig::from_path(&path).unwrap();
+        config.sft.minimind_file = None;
+        config.revisions.minimind = None;
+        let view = serde_json::to_string(&config).unwrap();
+        assert!(!view.contains("minimind"));
+        config.sft.minimind_file = Some("x.jsonl".into());
+        assert!(config.validate().is_err());
     }
 }

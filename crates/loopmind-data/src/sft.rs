@@ -1,6 +1,8 @@
-//! English chat SFT rows from FABLE, rendered with the M2 chat template.
+//! English chat SFT rows from FABLE, and optionally MiniMind's SFT file, rendered
+//! with the M2 chat template.
 //!
-//! Turkish rows are dropped. `raw_text_corpus` is not part of this stream.
+//! Non-English rows are dropped (FABLE's Turkish rows, MiniMind's Chinese rows).
+//! `raw_text_corpus` is not part of this stream. MiniMind rows follow FABLE's.
 //! Conversations longer than the context cap are dropped. A fixed number of
 //! checkable rows (math, logic, science, JSON) are held out of the train shards.
 
@@ -109,13 +111,24 @@ pub fn prepare_sft(
     if manifest_matches(&out_dir.join("manifest.json"), &fingerprint)? {
         return read_manifest(&out_dir.join("manifest.json"));
     }
-    let revision = config.revision("fable")?.to_string();
-    let skip = seen.to_string();
-    let mut child = pretrain::spawn_stream(
-        &config.python,
-        &script,
-        &["--kind", "sft", "--revision", &revision, "--skip", &skip],
-    )?;
+    let mut args = vec![
+        "--kind".to_string(),
+        "sft".to_string(),
+        "--revision".to_string(),
+        config.revision("fable")?.to_string(),
+        "--skip".to_string(),
+        seen.to_string(),
+    ];
+    if let Some(file) = &config.sft.minimind_file {
+        args.extend([
+            "--minimind-file".to_string(),
+            file.to_string_lossy().into_owned(),
+            "--minimind-revision".to_string(),
+            config.revision("minimind")?.to_string(),
+        ]);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut child = pretrain::spawn_stream(&config.python, &script, &args)?;
     let stdout = child
         .stdout
         .take()

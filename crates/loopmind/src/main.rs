@@ -53,7 +53,8 @@ enum Command {
         #[arg(long, default_value = "configs/data.toml")]
         config: PathBuf,
     },
-    /// Render English FABLE chat into SFT shards and an eval file.
+    /// Render English FABLE chat, plus MiniMind's English rows when `sft.minimind_file`
+    /// is set, into SFT shards and an eval file.
     PrepareSft {
         /// Data config. Paths inside it are relative to the repo root.
         #[arg(long, default_value = "configs/data.toml")]

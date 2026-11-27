@@ -39,6 +39,29 @@ Shards are little-endian `u16` files (`vocab` is 6400). The header is magic `LMD
 
 English chat rows from FABLE, excluding `raw_text_corpus` and the `turkish_language` config. `language` must be `en` or `english`. Rows are rendered with the M2 chat template (`<|bos|>`, role turns, `<|eos|>` when the transcript ends on an assistant turn). The loss mask is 1 on assistant content, the `<|im_end|>` that closes it, and that final `<|eos|>`.
 
+### MiniMind
+
+When `sft.minimind_file` is set, the English rows of [MiniMind](https://github.com/jingyaogong/minimind)'s SFT mix follow FABLE's in the same build, as config `minimind_sft`.
+
+| Setting | Value |
+| --- | --- |
+| Dataset | `jingyaogong/minimind_dataset` |
+| Revision | `revisions.minimind`, `312afb4f76391145c6902f765bb51691c09a12f5` |
+| File | `sft_t2t_mini.jsonl`, MiniMind's quick-run mix: 905,718 rows, 1.74 GB, SHA-256 `abb1e76b…fa518` |
+| Full mix | `sft_t2t.jsonl`, 14.1 GB; set `sft.minimind_file` to it to use it |
+| Local path | `data/raw/minimind/`; the stream downloads the file there when it is missing |
+
+Each row is `{"conversations": [{"role", "content", ...}]}`. `python/stream_corpus.py` turns it into FABLE's form:
+
+- **Language:** MiniMind has no language field. A row is tagged `zh`, and dropped as non-English, when its rendered text has any CJK character. The tool definitions count as rendered text. That leaves English rows only, which suits the English tokenizer and pretraining: Chinese costs this byte-level BPE three tokens per character.
+- **Tools:** `tools` (JSON strings) go into the system turn as FABLE does it: FABLE's tool instruction, then `<tools>[...]</tools>`. Each `tool_calls` entry becomes `<tool_call>{"name", "arguments"}</tool_call>` in the assistant turn, and `tool` turns are wrapped in `<tool_response></tool_response>`.
+- **Reasoning:** `reasoning_content` is dropped, so the model learns the final answers.
+- **Empty answers:** a row with an empty assistant answer and no tool call is sent empty, and is counted as `empty`.
+
+The eval split is unchanged. It is drawn from FABLE's four checkable configs only, and MiniMind rows follow FABLE's in the stream, so `eval.jsonl` is byte-identical to the FABLE-only build.
+
+The dataset card lists two licences, Apache-2.0 and CC-BY-NC-2.0, without saying which rows carry which. Treat a build that includes MiniMind as non-commercial. Its rows are recorded with the license string `apache-2.0 / cc-by-nc-2.0 (minimind_dataset)`.
+
 Kept conversations are at most `sft.max_tokens` (1024). Drop reasons recorded in the manifest: `non_english`, `cc_by_sa`, `too_long`, `empty`, `no_assistant`, `bad_role`. CC-BY-SA rows (license string containing `cc-by-sa`, case insensitive) are kept unless `sft.exclude_cc_by_sa` is true. `english_license_counts` counts every English row, including ones dropped later for length or license.
 
 Eval holds out `sft.eval_rows` (2000) checkable rows: `math_reasoning`, `logic_reasoning`, `science_knowledge`, and `structured_output`, 500 from each config, the lowest stable hashes first. If one config is short, the remainder is filled from the other three. Those rows are not in the train shards. `sft/eval.jsonl` stores `id`, `config`, `license`, `reference` (last assistant text), `tokens`, and `loss_mask`.
@@ -96,6 +119,39 @@ Eval is 500 rows from each of `math_reasoning`, `logic_reasoning`, `science_know
 On disk: train shards 153,426,899 bytes (600 files, 256 rows each, last shard shorter), `eval.jsonl` 3,768,063 bytes, staging checkpoint 237,751,964 bytes, manifest 105,652 bytes. `data/prepared/sft` is 395,052,578 bytes. Staging can be deleted after the manifest exists; a later run trusts the manifest. `data/prepared` together is 496,087,665 bytes.
 
 Train shards use magic `LMDS`. SFT sampling pads to 64, 128, 256, 512, or 1024. That sampler is what CI exercises, on synthetic shards, not on this download.
+
+### With MiniMind
+
+Measured on the 4070 box, 2026-11-27, with `sft.minimind_file = "data/raw/minimind/sft_t2t_mini.jsonl"`. The build took 149.8 s.
+
+| Outcome | FABLE only | FABLE + MiniMind |
+| --- | ---: | ---: |
+| seen | 200,000 | 1,105,718 |
+| kept train | 153,517 | 255,643 |
+| kept eval | 2,000 | 2,000 |
+| dropped non_english | 27,413 | 830,596 |
+| dropped too_long | 17,070 | 17,446 |
+| dropped empty | 0 | 33 |
+
+| MiniMind rows | Count |
+| --- | ---: |
+| in the file | 905,718 |
+| with CJK text, dropped | 803,183 |
+| English | 102,502 |
+| English, over 1,024 tokens | 376 |
+| English, kept for train | 102,126 |
+
+31,753 of the CJK drops have English messages but Chinese tool definitions or calls.
+
+| Train split | Rows | Tokens | Mean tokens | Padded to 64 |
+| --- | ---: | ---: | ---: | ---: |
+| FABLE | 153,517 | 51.0M | 332 | 56.0M |
+| MiniMind | 102,126 | 22.8M | 224 | 26.1M |
+| total | 255,643 | 73.8M | 289 | 82.0M |
+
+- The English MiniMind rows are general instruction and chat. 98% are single-turn (100,586 of 102,502). One has a tool call.
+- `eval.jsonl` has the same SHA-256 as the FABLE-only build (`1c17344a…`).
+- An SFT epoch is 15,978 steps of 16 rows, up from 9,595.
 
 ## Running it on the ThinkPad
 

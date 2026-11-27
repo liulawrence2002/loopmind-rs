@@ -11,6 +11,7 @@ fineweb = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
 cosmopedia = "3ba9d605774198c5868892d7a8deda78031a781f"
 tinystories = "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64"
 fable = "d0bcd6b2181f5588afa9e136a383397dff956620"
+minimind = "312afb4f76391145c6902f765bb51691c09a12f5"
 
 [pretrain]
 total_tokens = 50_000_000
@@ -22,3 +23,7 @@ shard_sequences = 512
 max_tokens = 1024
 eval_rows = 2000
 exclude_cc_by_sa = false
+# English rows of MiniMind's SFT mix (jingyaogong/minimind_dataset at revisions.minimind),
+# added after FABLE's. Downloaded here when missing. sft_t2t.jsonl is the 14 GB full mix.
+# The dataset card lists Apache-2.0 and CC-BY-NC-2.0 without a per-row split.
+minimind_file = "data/raw/minimind/sft_t2t_mini.jsonl"
