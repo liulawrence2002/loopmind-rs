@@ -45,6 +45,11 @@ impl TrainRng {
         k.saturating_sub(1).clamp(1, max)
     }
 
+    /// Uniform draw in `(0, 1)`.
+    pub fn uniform(&mut self) -> f64 {
+        self.next_unit()
+    }
+
     fn next_unit(&mut self) -> f64 {
         let mut x = self.state;
         x ^= x << 13;

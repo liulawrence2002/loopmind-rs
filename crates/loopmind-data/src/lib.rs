@@ -13,7 +13,9 @@ mod shard;
 
 pub use config::DataConfig;
 pub use error::DataError;
-pub use loader::{EpochCursor, PretrainBatch, PretrainLoader, SftBatch, SftLoader};
+pub use loader::{
+    read_sft_eval, EpochCursor, PretrainBatch, PretrainLoader, SftBatch, SftEvalRow, SftLoader,
+};
 pub use plan::{
     pretrain_tokens, scaled_budgets, CorpusSlice, SftPolicy, PRETRAIN_SLICES,
     PRETRAIN_TOKEN_TARGET, SFT_POLICY,

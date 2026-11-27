@@ -18,12 +18,12 @@ static INIT_RNG: Mutex<()> = Mutex::new(());
 use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
 use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams};
 use burn::tensor::{DType, Device, Tensor};
-use loopmind_data::PretrainBatch;
+use loopmind_data::{PretrainBatch, SftBatch};
 
-use crate::batches::pretrain_batch;
+use crate::batches::{pretrain_batch, sft_batch};
 use crate::config::LoopMindConfig;
-use crate::loopmind::{greedy_continue, LoopMind};
-use crate::loss::shifted_token_cross_entropy;
+use crate::loopmind::{greedy_continue, sample_continue, GenerateOptions, LoopMind};
+use crate::loss::{masked_shifted_nll_sum, shifted_token_cross_entropy};
 use crate::rng::TrainRng;
 
 /// Where the run executes.
@@ -89,6 +89,20 @@ pub struct MicroStats {
     pub aux: f32,
     pub loops: Vec<usize>,
     pub expert_slots: Vec<Vec<f32>>,
+    pub tokens: u64,
+}
+
+/// Result of one SFT microbatch backward.
+#[derive(Debug, Clone)]
+pub struct SftStats {
+    /// Sum of next-token NLL over supervised targets.
+    pub nll_sum: f32,
+    /// Supervised targets in the row (mask 1 at positions `1..seq`).
+    pub targets: u64,
+    pub aux: f32,
+    pub loops: Vec<usize>,
+    pub expert_slots: Vec<Vec<f32>>,
+    /// Padded tokens fed to the model.
     pub tokens: u64,
 }
 
@@ -178,6 +192,44 @@ impl PretrainEngine {
         })
     }
 
+    /// Weights from `model_path` with a fresh AdamW. SFT starts from a pretrain
+    /// checkpoint this way, and inference uses it because it never reads `optim.bpk`.
+    pub fn from_weights(
+        config: &LoopMindConfig,
+        seed: u64,
+        kind: EngineDevice,
+        settings: OptimSettings,
+        model_path: &Path,
+        requested: Precision,
+    ) -> Result<Self, String> {
+        let device = burn_device(kind)?;
+        let _guard = INIT_RNG.lock().expect("init rng lock");
+        device.seed(seed);
+        let mut model = LoopMind::init(config, &device)
+            .try_load_file(model_path)
+            .map_err(|error| error.to_string())?;
+        drop(_guard);
+        let precision = match requested {
+            Precision::F32 => "f32",
+            Precision::Auto => resolve_precision(kind, &device),
+        }
+        .to_string();
+        if let Some(dtype) = dtype_of(&precision) {
+            model = cast_parameters(model, dtype);
+        }
+        Ok(Self {
+            model: Some(model),
+            optim: adamw(settings),
+            accumulator: GradientsAccumulator::new(),
+            pending: 0,
+            rng: TrainRng::new(seed ^ 0xD1CE_5EED),
+            device,
+            precision,
+            kind,
+            grad_clip: settings.grad_clip,
+        })
+    }
+
     pub fn precision(&self) -> &str {
         &self.precision
     }
@@ -213,17 +265,11 @@ impl PretrainEngine {
         self.rng = rng;
         let aux = out.aux_loss.clone();
         let loss = shifted_token_cross_entropy(out.logits, tokens) + aux.clone();
-        let loss_value = loss.clone().into_scalar::<f32>();
-        let aux_value = aux.into_scalar::<f32>();
+        let [loss_value, aux_value] = read_pair(&loss, &aux);
         if !loss_value.is_finite() {
             return Err("pretrain loss is not finite".into());
         }
-        let mut grads = GradientsParams::from_grads(loss.backward(), self.net());
-        detach_grads(self.net(), &mut grads);
-        let model = self.model.take().expect("model is loaded");
-        self.accumulator.accumulate(&model, grads);
-        self.model = Some(model);
-        self.pending += 1;
+        self.backward(loss);
         Ok(MicroStats {
             loss: loss_value,
             aux: aux_value,
@@ -233,17 +279,80 @@ impl PretrainEngine {
         })
     }
 
+    /// One SFT microbatch. The backward loss is `token_scale * masked_nll_sum + aux_scale * aux`.
+    ///
+    /// The driver sets `token_scale` to one over the step's supervised targets and
+    /// `aux_scale` to one over its rows, then calls [`PretrainEngine::apply_summed`], so a
+    /// step is the token-mean loss over every supervised target in it.
+    pub fn accumulate_sft(
+        &mut self,
+        batch: &SftBatch,
+        token_scale: f32,
+        aux_scale: f32,
+    ) -> Result<SftStats, String> {
+        if batch.seq_len < 2 {
+            return Err("an SFT row needs at least 2 tokens".into());
+        }
+        let targets = batch.supervised_targets();
+        let (tokens, mask) = sft_batch(batch, &self.device);
+        let mut rng = self.rng.clone();
+        let model = self.model.as_ref().expect("model is loaded");
+        let out = model.forward_sampled(tokens.clone(), &mut rng);
+        self.rng = rng;
+        let aux = out.aux_loss.clone();
+        let nll = masked_shifted_nll_sum(out.logits, tokens, mask);
+        let [nll_value, aux_value] = read_pair(&nll, &aux);
+        if !nll_value.is_finite() {
+            return Err("sft loss is not finite".into());
+        }
+        self.backward(nll.mul_scalar(token_scale) + aux.mul_scalar(aux_scale));
+        Ok(SftStats {
+            nll_sum: nll_value,
+            targets,
+            aux: aux_value,
+            loops: out.loops,
+            expert_slots: out.expert_slots,
+            tokens: (batch.batch * batch.seq_len) as u64,
+        })
+    }
+
+    fn backward(&mut self, loss: Tensor<1>) {
+        let mut grads = GradientsParams::from_grads(loss.backward(), self.net());
+        detach_grads(self.net(), &mut grads);
+        let model = self.model.take().expect("model is loaded");
+        self.accumulator.accumulate(&model, grads);
+        self.model = Some(model);
+        self.pending += 1;
+    }
+
+    /// Average the accumulated microbatch gradients, clip, and step.
     pub fn apply(&mut self, learning_rate: f64) -> Result<ApplyStats, String> {
         if self.pending == 0 {
             return Err("no gradients to apply".into());
         }
-        let scale = 1.0 / self.pending as f32;
+        self.apply_scaled(learning_rate, 1.0 / self.pending as f32)
+    }
+
+    /// Step on the summed gradients. Microbatch losses were already scaled by the caller.
+    pub fn apply_summed(&mut self, learning_rate: f64) -> Result<ApplyStats, String> {
+        if self.pending == 0 {
+            return Err("no gradients to apply".into());
+        }
+        self.apply_scaled(learning_rate, 1.0)
+    }
+
+    fn apply_scaled(&mut self, learning_rate: f64, scale: f32) -> Result<ApplyStats, String> {
         let mut grads = self.accumulator.grads();
-        scale_grads(self.net(), &mut grads, scale);
-        let grad_norm = grad_norm(self.net(), &grads);
+        // The norm of `scale * g` is `scale * |g|`, so averaging and clipping share one rescale.
+        let grad_norm = grad_norm(self.net(), &grads) * scale;
         let clip = self.grad_clip;
-        if clip > 0.0 && grad_norm > clip {
-            scale_grads(self.net(), &mut grads, clip / grad_norm);
+        let factor = if clip > 0.0 && grad_norm > clip {
+            scale * clip / grad_norm
+        } else {
+            scale
+        };
+        if factor != 1.0 {
+            scale_grads(self.net(), &mut grads, factor);
         }
         let model = self.model.take().expect("model is loaded");
         self.model = Some(self.optim.step(learning_rate, model, grads));
@@ -261,9 +370,23 @@ impl PretrainEngine {
         Ok(loss.into_scalar::<f32>())
     }
 
+    /// Masked NLL sum and supervised-target count at a fixed `r`, without an autodiff graph.
+    pub fn validate_sft(&self, batch: &SftBatch, loops: usize) -> Result<(f32, u64), String> {
+        let (tokens, mask) = sft_batch(batch, &self.plain_device());
+        let out = self.net().valid().forward(tokens.clone(), loops);
+        let nll = masked_shifted_nll_sum(out.logits, tokens, mask);
+        Ok((nll.into_scalar::<f32>(), batch.supervised_targets()))
+    }
+
     pub fn greedy(&self, ids: Vec<u32>, loops: usize, max_new: usize, eos: u32) -> Vec<u32> {
         let device = self.plain_device();
         greedy_continue(&self.net().valid(), ids, loops, max_new, eos, &device)
+    }
+
+    /// Sampled continuation that stops on any id in `stop`. Returns only the new ids.
+    pub fn generate(&self, ids: Vec<u32>, options: &GenerateOptions, stop: &[u32]) -> Vec<u32> {
+        let device = self.plain_device();
+        sample_continue(&self.net().valid(), ids, options, stop, &device)
     }
 
     fn plain_device(&self) -> Device {
@@ -375,23 +498,48 @@ fn cast_parameters(model: LoopMind, dtype: DType) -> LoopMind {
     model.map(&mut Cast(dtype))
 }
 
+/// Global L2 norm of the gradients, read back in one device sync.
 fn grad_norm(model: &LoopMind, grads: &GradientsParams) -> f32 {
     struct Norm<'a> {
         grads: &'a GradientsParams,
-        sum: f64,
+        squares: Vec<Tensor<1>>,
     }
     impl ModuleVisitor for Norm<'_> {
         fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
             let Some(grad) = self.grads.get::<D>(param.id) else {
                 return;
             };
-            let square = grad.powf_scalar(2.0).sum().into_scalar::<f32>();
-            self.sum += f64::from(square);
+            self.squares
+                .push(grad.cast(DType::F32).powf_scalar(2.0).sum());
         }
     }
-    let mut norm = Norm { grads, sum: 0.0 };
+    let mut norm = Norm {
+        grads,
+        squares: Vec::new(),
+    };
     model.visit(&mut norm);
-    norm.sum.sqrt() as f32
+    if norm.squares.is_empty() {
+        return 0.0;
+    }
+    Tensor::cat(norm.squares, 0)
+        .sum()
+        .into_scalar::<f32>()
+        .sqrt()
+}
+
+/// Two scalars in one device read.
+fn read_pair(first: &Tensor<1>, second: &Tensor<1>) -> [f32; 2] {
+    let values = Tensor::cat(
+        vec![
+            first.clone().detach().cast(DType::F32),
+            second.clone().detach().cast(DType::F32),
+        ],
+        0,
+    )
+    .into_data()
+    .try_into_vec::<f32>()
+    .expect("loss scalars are f32");
+    [values[0], values[1]]
 }
 
 fn detach_grads(model: &LoopMind, grads: &mut GradientsParams) {
@@ -425,4 +573,40 @@ fn scale_grads(model: &LoopMind, grads: &mut GradientsParams, scale: f32) {
     }
     let mut scale = Scale { grads, scale };
     model.visit(&mut scale);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::{Int, TensorData};
+
+    /// Every f32 helper tensor (RoPE tables, expert one-hot, slot fractions) must be
+    /// cast to the weights' dtype. On flex a mix panics; on CUDA it read as garbage
+    /// and the first bf16 loss was not finite.
+    #[test]
+    fn bf16_weights_give_a_finite_loss_and_gradient() {
+        let device = Device::flex().autodiff();
+        device.seed(42);
+        let config = LoopMindConfig::tiny();
+        let model = cast_parameters(LoopMind::init(&config, &device), DType::BF16);
+        let ids: Vec<i32> = (0..12).map(|index| index * 37 % 128).collect();
+        let tokens = Tensor::<2, Int>::from_data(TensorData::new(ids, [1, 12]), &device);
+        let out = model.forward_train_at(tokens.clone(), 3, None);
+        assert_eq!(out.logits.dtype(), DType::BF16);
+        let loss = shifted_token_cross_entropy(out.logits, tokens) + out.aux_loss;
+        let value = loss.clone().cast(DType::F32).into_scalar::<f32>();
+        assert!(value.is_finite(), "bf16 loss {value}");
+        let grads = loss.backward();
+        let grad = model
+            .embed
+            .weight
+            .val()
+            .grad(&grads)
+            .expect("embedding gradient")
+            .cast(DType::F32)
+            .into_data()
+            .try_into_vec::<f32>()
+            .unwrap();
+        assert!(grad.iter().all(|entry| entry.is_finite()));
+    }
 }

@@ -30,9 +30,14 @@ mod model_tests;
 pub use batches::{pretrain_batch, sft_batch};
 pub use blocks::Mixture;
 pub use config::{ConfigError, LoopMindConfig};
-pub use engine::{ApplyStats, EngineDevice, MicroStats, OptimSettings, Precision, PretrainEngine};
+pub use engine::{
+    ApplyStats, EngineDevice, MicroStats, OptimSettings, Precision, PretrainEngine, SftStats,
+};
 pub use framework::{compiled_backends, framework_name};
-pub use loopmind::{export_parity_fixture, greedy_continue, ForwardOutput, LoopMind};
-pub use loss::{shifted_token_cross_entropy, token_cross_entropy};
+pub use loopmind::{
+    export_parity_fixture, greedy_continue, sample_continue, ForwardOutput, GenerateOptions,
+    LoopMind,
+};
+pub use loss::{masked_shifted_nll_sum, shifted_token_cross_entropy, token_cross_entropy};
 pub use params::ParamBreakdown;
 pub use rng::TrainRng;

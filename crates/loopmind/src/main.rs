@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use loopmind_model::{ConfigError, LoopMindConfig};
-use loopmind_tokenizer::{LoopTokenizer, TrainConfig};
+use loopmind_model::{ConfigError, GenerateOptions, LoopMindConfig};
+use loopmind_tokenizer::{ChatTurn, LoopTokenizer, Role, TrainConfig};
 
 #[derive(Parser)]
 #[command(
@@ -93,10 +93,60 @@ enum Command {
         #[arg(long, default_value = "cpu")]
         device: String,
     },
-    /// Supervised-finetune on English chat (M5).
-    Sft,
-    /// Chat with a finetuned checkpoint (M5).
-    Chat,
+    /// Supervised-finetune a pretrain checkpoint on English chat (M5).
+    Sft {
+        /// SFT config. Paths inside it are relative to the repo root.
+        #[arg(long, default_value = "configs/sft.toml")]
+        config: PathBuf,
+        /// Continue from the latest checkpoint in the run directory.
+        #[arg(long)]
+        resume: bool,
+        /// Stop after this many optimizer steps. Overrides the config.
+        #[arg(long)]
+        max_steps: Option<u64>,
+        /// `cpu`, `cuda`, or `wgpu`. Overrides the config.
+        #[arg(long)]
+        device: Option<String>,
+        /// Pretrain checkpoint, or a run directory with latest.json. Overrides `init`.
+        #[arg(long)]
+        init: Option<PathBuf>,
+    },
+    /// Chat with an SFT checkpoint (M5). Reads turns from stdin unless --prompt is given.
+    Chat {
+        /// Checkpoint directory, or a run directory whose latest.json names one.
+        #[arg(long, default_value = "runs/sft")]
+        checkpoint: PathBuf,
+        /// One user message. Prints the answer and exits.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Optional system message at the start of the conversation.
+        #[arg(long)]
+        system: Option<String>,
+        /// Fixed loop count `r`.
+        #[arg(long, default_value_t = 4)]
+        loops: usize,
+        /// New tokens per answer.
+        #[arg(long, default_value_t = 256)]
+        max_new: usize,
+        /// Softmax temperature. 0 is greedy.
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f32,
+        /// Sample among this many most likely tokens. 0 keeps all.
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        /// Penalty on tokens already in the context. 1.0 turns it off.
+        #[arg(long, default_value_t = 1.1)]
+        repetition_penalty: f32,
+        /// Sampling seed.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Path to tokenizer.json.
+        #[arg(long, default_value = "tokenizer/tokenizer.json")]
+        tokenizer: PathBuf,
+        /// `cpu`, `cuda`, or `wgpu`.
+        #[arg(long, default_value = "cpu")]
+        device: String,
+    },
     /// Print the parameter breakdown for a config.
     Params {
         /// Path to a LoopMind TOML config.
@@ -276,20 +326,81 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 loopmind_train::generate(&checkpoint, &ids, loops, max_new, eos, &device)?;
             println!("{}", tokenizer.decode(&generated)?);
         }
-        Command::Sft => {
-            let policy = loopmind_data::SFT_POLICY;
-            println!("{}", loopmind_train::sft_status());
+        Command::Sft {
+            config,
+            resume,
+            max_steps,
+            device,
+            init,
+        } => {
+            let mut config = load_sft_config(config)?;
+            if let Some(init) = init {
+                config.init = find_dir(init)?;
+            }
+            let summary = loopmind_train::sft(
+                &config,
+                &loopmind_train::RunOverrides {
+                    resume,
+                    max_steps,
+                    device,
+                },
+            )?;
             println!(
-                "sft: {} chat from {}, drop {}, max {} tokens, hold out {}",
-                policy.keep_language,
-                policy.dataset,
-                policy.drop_languages.join(", "),
-                policy.max_tokens,
-                policy.eval_holdout
+                "finished {} sft steps, {} tokens, loss {:.4}, {} {}",
+                summary.steps,
+                summary.tokens_seen,
+                summary.final_loss,
+                summary.device,
+                summary.precision
             );
         }
-        Command::Chat => {
-            println!("chat is not implemented yet (planned for M5)");
+        Command::Chat {
+            checkpoint,
+            prompt,
+            system,
+            loops,
+            max_new,
+            temperature,
+            top_k,
+            repetition_penalty,
+            seed,
+            tokenizer,
+            device,
+        } => {
+            let checkpoint = find_dir(checkpoint)?;
+            let tokenizer = LoopTokenizer::from_file(&find_file(tokenizer)?)?;
+            let special = |name: &str| {
+                tokenizer
+                    .token_id(name)
+                    .ok_or_else(|| ConfigError::Invalid(format!("tokenizer is missing {name}")))
+            };
+            let stop = [
+                special(loopmind_tokenizer::IM_END)?,
+                special(loopmind_tokenizer::EOS)?,
+            ];
+            let engine = loopmind_train::load_inference(&checkpoint, &device)?;
+            let context = engine.config().context_length;
+            let mut chat = Chat {
+                engine,
+                tokenizer: &tokenizer,
+                stop,
+                context,
+                history: system
+                    .map(|text| vec![ChatTurn::new(Role::System, text)])
+                    .unwrap_or_default(),
+                options: GenerateOptions {
+                    loops,
+                    max_new,
+                    temperature,
+                    top_k,
+                    repetition_penalty,
+                    seed,
+                },
+            };
+            match prompt {
+                Some(prompt) => println!("{}", chat.respond(prompt)?),
+                None => chat.repl()?,
+            }
         }
         Command::Params { config } => {
             let path = find_file(config)?;
@@ -332,6 +443,94 @@ fn load_data_config(
         config.output_dir = root.join(&config.output_dir);
     }
     Ok(config)
+}
+
+fn load_sft_config(path: PathBuf) -> Result<loopmind_train::SftConfig, Box<dyn std::error::Error>> {
+    let path = find_file(path)?;
+    let mut config = loopmind_train::SftConfig::from_path(&path)?;
+    let root = path.parent().and_then(|dir| dir.parent()).ok_or_else(|| {
+        ConfigError::Invalid("sft config is not inside a configs directory".into())
+    })?;
+    for slot in [
+        &mut config.init,
+        &mut config.data_dir,
+        &mut config.run_dir,
+        &mut config.tokenizer,
+    ] {
+        if slot.is_relative() {
+            *slot = root.join(&*slot);
+        }
+    }
+    Ok(config)
+}
+
+/// A conversation with one checkpoint. Turns are rendered with the M2 chat template.
+struct Chat<'a> {
+    engine: loopmind_model::PretrainEngine,
+    tokenizer: &'a LoopTokenizer,
+    stop: [u32; 2],
+    context: usize,
+    history: Vec<ChatTurn>,
+    options: GenerateOptions,
+}
+
+impl Chat<'_> {
+    fn respond(&mut self, user: String) -> Result<String, Box<dyn std::error::Error>> {
+        self.history.push(ChatTurn::new(Role::User, user));
+        let mut prompt = self.tokenizer.render_chat(&self.history, true)?;
+        // Drop the oldest non-system turns until the prompt leaves room for the answer.
+        while prompt.ids.len() + self.options.max_new > self.context {
+            let first = usize::from(
+                self.history
+                    .first()
+                    .is_some_and(|turn| turn.role == Role::System),
+            );
+            if self.history.len() <= first + 1 {
+                break;
+            }
+            self.history.remove(first);
+            prompt = self.tokenizer.render_chat(&self.history, true)?;
+        }
+        let ids = self.engine.generate(prompt.ids, &self.options, &self.stop);
+        self.options.seed = self.options.seed.wrapping_add(1);
+        let text = self.tokenizer.decode(&ids)?.trim().to_string();
+        self.history
+            .push(ChatTurn::new(Role::Assistant, text.clone()));
+        Ok(text)
+    }
+
+    fn repl(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{BufRead, Write};
+        eprintln!(
+            "loopmind chat, r = {}. /reset clears the history, /exit or Ctrl-D quits.",
+            self.options.loops
+        );
+        let stdin = std::io::stdin();
+        let keep = usize::from(
+            self.history
+                .first()
+                .is_some_and(|turn| turn.role == Role::System),
+        );
+        loop {
+            eprint!("> ");
+            std::io::stderr().flush()?;
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                break;
+            }
+            let line = line.trim();
+            match line {
+                "" => continue,
+                "/exit" | "/quit" => break,
+                "/reset" => {
+                    self.history.truncate(keep);
+                    eprintln!("(history cleared)");
+                }
+                _ => println!("{}\n", self.respond(line.to_string())?),
+            }
+        }
+        Ok(())
+    }
 }
 
 fn find_file(path: PathBuf) -> Result<PathBuf, ConfigError> {

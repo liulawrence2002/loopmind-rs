@@ -17,7 +17,7 @@ Stop early with `--max-steps N`. Resume with `--resume`; it loads `runs/pretrain
 - Weight decay hits the matrices and skips the token embedding and every RMSNorm scale (`embed` and `norm` in the parameter path).
 - The learning rate warms up linearly for `warmup_steps`, then cosine-decays from `learning_rate` to `min_learning_rate` across the planned epoch.
 
-Checkpoints land in `runs/pretrain/checkpoints/step-NNNNNNNN/` and contain `model.bpk`, `optim.bpk`, and `state.json` (step, data cursor, loop RNG, schedule length, model config). `checkpoint.keep` is how many of those directories to retain. The run also writes one at the end.
+Checkpoints land in `runs/pretrain/checkpoints/step-NNNNNNNN/` and contain `model.bpk`, `optim.bpk`, and `state.json` (step, data cursor, loop RNG, schedule length, model config). `checkpoint.keep` is how many of those directories to retain. The run also writes one at the end. A step's checkpoint is written before that step's validation, so a failed validation never costs the checkpoint.
 
 ## Device and precision
 
@@ -25,7 +25,9 @@ Checkpoints land in `runs/pretrain/checkpoints/step-NNNNNNNN/` and contain `mode
 
 `--device cuda` needs a binary built with `--features cuda`. `--device wgpu` needs `--features wgpu`. Both train in f32 by default.
 
-`precision` in `configs/pretrain.toml` is `"f32"` (the default) or `"auto"`. With `"auto"`, a CUDA run tries a bf16 matmul, then f16, and casts every weight to the first dtype that returns finite values. Burn then updates those tensors in place, so there is no f32 master copy. On the RTX 4070 Laptop, `"auto"` picked bf16 and the first microbatch's loss was not finite. Even with a finite loss it would be a poor trade on this model:
+`precision` in `configs/pretrain.toml` is `"f32"` (the default) or `"auto"`. With `"auto"`, a CUDA run tries a bf16 matmul, then f16, and casts every weight to the first dtype that returns finite values. Burn then updates those tensors in place, so there is no f32 master copy.
+
+On the RTX 4070 Laptop, the first `"auto"` run picked bf16 and its first microbatch's loss was not finite. The cause was three f32 helper tensors meeting bf16 activations: the RoPE tables, the one-hot of the routed expert ids, and the slot fractions in the balance loss. Burn's flex backend panics on that mix (`dtype mismatch (expected BF16, got F32)`). On CUDA it read as garbage. All three are now cast to the activations' dtype, and `bf16_weights_give_a_finite_loss_and_gradient` runs a bf16 forward and backward on flex. f32 stays the default because bf16 without a master copy is still a poor trade on this model:
 
 - An RMSNorm gain starts at 1.0, where half a bf16 ulp is about 0.004. An AdamW step is about `lr`, at most 3e-4, so the gains would never move.
 - Decoupled weight decay at `lr * 0.1` scales each weight by about `1 - 3e-5`, which rounds back to 1 in bf16.
@@ -82,11 +84,42 @@ Measured on the dev box: RTX 4070 Laptop (8 GB, driver 550, CUDA 12.5 toolkit), 
 | `nvidia-smi` memory | 6.7 GB by step 6, flat at 7.4 GB from step ~77 |
 | GPU utilization | about 40% |
 | `mfu` | about 0.85% of 15 TFLOP/s |
-| Epoch | 6,104 steps, about 3.5 hours |
+| Epoch | 6,104 steps, about 3.5 hours before the fused experts below |
 
 The early curve matches the CPU smoke below: loss 7.146 at step 100 (CPU 7.140) and 6.765 at step 150 (CPU 6.752).
 
-The GPU sits at ~40% because the step is launch-bound. Each core layer evaluates all 32 experts as separate `[1024, 256] × [256, 128]` SwiGLUs, about 100 small matmuls per layer per pass, plus a host read of the expert-slot fractions after every layer. Concatenating the expert weights into one `[256, 4096]` gate/up and one `[4096, 256]` down gives the same output and gradients with three large matmuls. That is the obvious next speedup. It does not change the checkpoint.
+The GPU sat at ~40% because the step was launch-bound. Each core layer evaluated all 32 experts as separate `[1024, 256] × [256, 128]` SwiGLUs, about 100 small matmuls per layer per pass, plus a host read of the expert-slot fractions after every layer.
+
+### Fused experts
+
+`Mixture::forward` now concatenates the experts' weights into one `[256, 4096]` gate, one `[256, 4096]` up, and one `[4096, 256]` down. The router's gates are repeated across each expert's 128 columns, so `down_e(h_e) * g_e` summed over experts becomes `concat_e(h_e * g_e) @ concat_e(down_e)`: three large matmuls instead of 96 small ones. The core is shared across loop passes, so a forward concatenates once per layer and every pass reuses it. Gradients flow back through the concat into each expert's own `Linear`, so the checkpoint layout is unchanged.
+
+The same change builds the RoPE tables and causal mask once per forward instead of once per attention call. It reads the expert-slot fractions back once per forward instead of once per layer per pass, the global grad norm in one read instead of one per parameter tensor, and the loss with its aux term in one read.
+
+`fused_experts_match_the_per_expert_loop` checks outputs and every expert weight's gradient against the old loop to 1e-5. PyTorch parity on the tiny config is still 9.5e-7. On the real run, step 1,601 resumed from the step-1,600 checkpoint gave loss 5.0310 and grad norm 1.039 with the fused binary, against 5.0308 and 1.038 from the old one.
+
+| From step 1,600 | Per-expert loop | Fused |
+| --- | ---: | ---: |
+| Throughput | ~4,100 tok/s (up to ~7,800 on an idle CPU) | ~12,000 tok/s (10,000–15,000) |
+| GPU utilization | ~40% | ~75–85% |
+| `nvidia-smi` memory | 7.4 GB | 6.7–7.6 GB (4.4 GB after the fix below) |
+| `mfu` | ~0.85% | ~2.3% |
+
+At that rate an epoch is about 70 minutes.
+
+### Memory grew with `r`
+
+At step 5,701 the run ran out of device memory on an ordinary training step. Passes before the last `bptt_passes` were detached, but autodiff still kept their activations alive until backward, so memory grew with the sampled loop count. With a loop mean of 14, a synthetic run failed on its first step. The live run sat at ~7.6 GB, so a rare high-`r` sequence was enough.
+
+`recur` now runs those passes on the model's non-autodiff copy (`Module::valid`, `Tensor::inner`) and lifts the result back as a constant. Values and gradients are unchanged: those passes never received gradients. `passes_before_the_window_run_untracked_but_keep_the_values` checks the logits against the untruncated forward on an autodiff device.
+
+| Peak `nvidia-smi` memory | Before | After |
+| --- | ---: | ---: |
+| Loop mean 14 (r ≈ 13) | out of memory | 4.4 GB |
+| Loop mean 4, live run | 7.6 GB | 4.4 GB |
+| Loop mean 2 | 3.3 GB | 3.3 GB |
+
+Resumed from the step-5,600 checkpoint, steps 5,601–5,604 reproduced the crashed run's loss, grad norm, and loop counts to four decimals.
 
 ## Greedy samples
 
