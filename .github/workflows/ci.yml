@@ -34,3 +34,30 @@ jobs:
 
       - name: Parameter census
         run: cargo run -p loopmind -- params
+
+  parity:
+    name: pytorch parity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CPU PyTorch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Export Burn logits
+        run: cargo test -p loopmind-model -- --exact model_tests::export_parity_fixture_writes_logits
+
+      - name: Compare with the PyTorch reference
+        run: python python/reference.py target/parity

@@ -1,0 +1,26 @@
+# Small LoopMind config for parity and gradient tests.
+# Same block layout as configs/default.toml.
+
+d_model = 64
+n_q_heads = 4
+n_kv_heads = 2
+rope_theta = 1000000.0
+rms_norm_eps = 1e-6
+vocab_size = 128
+tie_embeddings = true
+context_length = 32
+
+n_prelude_layers = 1
+n_core_layers = 2
+n_coda_layers = 1
+dense_intermediate_size = 128
+
+n_experts = 4
+expert_intermediate_size = 32
+experts_per_token = 2
+reroute_every_pass = true
+
+loop_count_mean = 4.0
+loop_count_max = 16
+bptt_passes = 4
+aux_loss_coef = 1e-2
