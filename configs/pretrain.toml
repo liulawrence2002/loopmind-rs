@@ -12,6 +12,9 @@ seed = 42
 epochs = 1
 max_steps = 0
 device = "cpu"
+# f32 weights and AdamW state. "auto" lets CUDA cast the weights to bf16 or f16
+# with no f32 master copy; on the 4070 that run went non-finite on step 1.
+precision = "f32"
 peak_tflops = 15.0
 val_loops = [1, 2, 4, 8]
 

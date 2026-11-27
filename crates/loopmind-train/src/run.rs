@@ -12,7 +12,7 @@ use std::time::Instant;
 static RUN_LOCK: Mutex<()> = Mutex::new(());
 
 use loopmind_data::{EpochCursor, PretrainLoader};
-use loopmind_model::{EngineDevice, LoopMindConfig, OptimSettings, PretrainEngine};
+use loopmind_model::{EngineDevice, LoopMindConfig, OptimSettings, Precision, PretrainEngine};
 use serde::{Deserialize, Serialize};
 
 use crate::config::PretrainConfig;
@@ -115,7 +115,8 @@ pub fn pretrain(
             meta.schedule_steps,
         )
     } else {
-        let engine = PretrainEngine::new(&model_config, config.seed, kind, settings)?;
+        let requested = Precision::parse(&config.precision)?;
+        let engine = PretrainEngine::new(&model_config, config.seed, kind, settings, requested)?;
         (engine, EpochCursor::new(config.seed), 0, 0, schedule_steps)
     };
     println!(
@@ -486,6 +487,7 @@ mod tests {
             epochs: 30,
             max_steps: 40,
             device: "cpu".into(),
+            precision: "f32".into(),
             peak_tflops: 1.0,
             optim: crate::config::OptimConfig {
                 learning_rate: 1.0e-2,

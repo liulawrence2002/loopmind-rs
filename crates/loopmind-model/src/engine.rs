@@ -1,10 +1,12 @@
 //! One pretrain step: sampled loops, shifted cross-entropy, aux loss, AdamW.
 //!
 //! Weight decay is not applied to embeddings or RMSNorm scales. Gradients are
-//! clipped by their global L2 norm. CPU and wgpu stay in f32. A CUDA build
-//! tries bf16, then f16, and stays on f32 if that matmul does not return
-//! finite values. The stored weights use that dtype; Burn updates them in
-//! place, so there is no separate f32 master copy.
+//! clipped by their global L2 norm. Weights are f32 unless the run asks for
+//! [`Precision::Auto`]. Then a CUDA build tries bf16, then f16, and stays on
+//! f32 if that matmul does not return finite values. The stored weights use
+//! that dtype and Burn updates them in place, so there is no f32 master copy.
+//! An AdamW step near `lr` is below half a bf16 ulp of an RMSNorm gain of 1.0,
+//! which is why f32 is the default.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -47,6 +49,25 @@ impl EngineDevice {
             Self::Cpu => "cpu",
             Self::Cuda => "cuda",
             Self::Wgpu => "wgpu",
+        }
+    }
+}
+
+/// Weight dtype a run asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precision {
+    /// f32 weights and optimizer state on every device.
+    F32,
+    /// On CUDA, probe bf16 then f16 and cast the weights to the first that works.
+    Auto,
+}
+
+impl Precision {
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "f32" => Ok(Self::F32),
+            "auto" => Ok(Self::Auto),
+            other => Err(format!("unknown precision {other}; use f32 or auto")),
         }
     }
 }
@@ -95,13 +116,18 @@ impl PretrainEngine {
         seed: u64,
         kind: EngineDevice,
         settings: OptimSettings,
+        requested: Precision,
     ) -> Result<Self, String> {
         let device = burn_device(kind)?;
         let _guard = INIT_RNG.lock().expect("init rng lock");
         device.seed(seed);
         let mut model = LoopMind::init(config, &device);
         drop(_guard);
-        let precision = resolve_precision(kind, &device).to_string();
+        let precision = match requested {
+            Precision::F32 => "f32",
+            Precision::Auto => resolve_precision(kind, &device),
+        }
+        .to_string();
         if let Some(dtype) = dtype_of(&precision) {
             model = cast_parameters(model, dtype);
         }
@@ -225,15 +251,23 @@ impl PretrainEngine {
         Ok(ApplyStats { grad_norm })
     }
 
+    /// Loss at a fixed `r`, without an autodiff graph. An untruncated forward on the
+    /// training device would keep every pass's activations alive, twice the four
+    /// backprop passes of a training step at `r = 8`.
     pub fn validate(&self, batch: &PretrainBatch, loops: usize) -> Result<f32, String> {
-        let tokens = pretrain_batch(batch, &self.device);
-        let out = self.net().forward(tokens.clone(), loops);
+        let tokens = pretrain_batch(batch, &self.plain_device());
+        let out = self.net().valid().forward(tokens.clone(), loops);
         let loss = shifted_token_cross_entropy(out.logits, tokens);
         Ok(loss.into_scalar::<f32>())
     }
 
     pub fn greedy(&self, ids: Vec<u32>, loops: usize, max_new: usize, eos: u32) -> Vec<u32> {
-        greedy_continue(self.net(), ids, loops, max_new, eos, &self.device)
+        let device = self.plain_device();
+        greedy_continue(&self.net().valid(), ids, loops, max_new, eos, &device)
+    }
+
+    fn plain_device(&self) -> Device {
+        self.device.clone().inner()
     }
 
     pub fn save(&self, model_path: &Path, optim_path: &Path) -> Result<(), String> {
