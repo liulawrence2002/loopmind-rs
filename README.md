@@ -150,7 +150,7 @@ cargo run -p moe-bakeoff --release --features cuda   # RTX 4070 Laptop, needs th
 | M3 | Data pipeline for the pretrain mix and the English SFT split. Done. See [docs/data.md](docs/data.md). |
 | M4 | Pretrain loop: AdamW, sampled loop counts, truncated backprop, checkpoints. Done. See [docs/pretrain.md](docs/pretrain.md). |
 | M5 | SFT and the chat CLI. Done. See [docs/sft.md](docs/sft.md). |
-| M6 | Held-out eval, loop-dial tuning, a low-LR refinement pass, and self-generated DPO. See [docs/refine.md](docs/refine.md). |
+| M6 | Held-out eval, loop-dial tuning, a low-LR refinement pass, and self-generated DPO. Done: the refinement pass is kept, and DPO was discarded. See [docs/refine.md](docs/refine.md). |
 
 
 ## Hardware
