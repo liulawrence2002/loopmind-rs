@@ -512,11 +512,15 @@ pub fn report_markdown(report: &EvalReport) -> String {
         "# Eval of {}\n\nHeld-out masked loss over {} eval rows ({} supervised targets):\n\n| r | loss |\n| ---: | ---: |\n",
         report.checkpoint, report.nll_rows, report.nll_targets
     );
-    for (key, value) in &report.nll {
-        text.push_str(&format!(
-            "| {} | {value:.4} |\n",
-            key.trim_start_matches('r')
-        ));
+    // The keys are strings ("r16" sorts before "r2"), so order the rows by loop count.
+    let mut losses: Vec<(usize, f32)> = report
+        .nll
+        .iter()
+        .filter_map(|(key, value)| Some((key.trim_start_matches('r').parse().ok()?, *value)))
+        .collect();
+    losses.sort_by_key(|(loops, _)| *loops);
+    for (loops, value) in losses {
+        text.push_str(&format!("| {loops} | {value:.4} |\n"));
     }
     text.push_str(
         "\nScored answers (correct / scored; science is multiple choice only, JSON is exact match):\n\n| r | sampling | macro | math | logic | science | JSON exact | JSON valid | seconds |\n| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
@@ -601,5 +605,43 @@ mod tests {
             );
         }
         eprintln!("{counts:?}");
+    }
+
+    #[test]
+    fn markdown_orders_the_loss_rows_by_loop_count() {
+        let report = EvalReport {
+            checkpoint: "runs/sft".into(),
+            nll: [("r1", 1.2), ("r16", 1.4), ("r2", 1.1), ("r8", 1.0)]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+            nll_rows: 4,
+            nll_targets: 40,
+            best_nll_loops: 8,
+            generation: Vec::new(),
+            recommended: Recommended {
+                loops: 8,
+                sampling: Sampling::greedy(),
+                macro_accuracy: 0.0,
+                nll: Some(1.0),
+            },
+            smoke: Vec::new(),
+            seconds: 0.0,
+        };
+        let text = report_markdown(&report);
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|line| line.ends_with(" |") && line.split('|').count() == 4)
+            .skip(2) // the header and its separator
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "| 1 | 1.2000 |",
+                "| 2 | 1.1000 |",
+                "| 8 | 1.0000 |",
+                "| 16 | 1.4000 |"
+            ]
+        );
     }
 }

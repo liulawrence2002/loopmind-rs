@@ -195,7 +195,7 @@ for label, path in [("SFT", "runs/eval/sft.json"), ("SFT + refine pass", "runs/e
 sft = json.load(open("runs/eval/sft.json"))
 lines += ["", "Loop dial on the SFT model (masked loss over all 2,000 eval rows, greedy macro accuracy on 50 rows per config):", "",
           "| r | loss | greedy macro |", "| ---: | ---: | ---: |"]
-for key, value in sft["nll"].items():
+for key, value in sorted(sft["nll"].items(), key=lambda item: int(item[0][1:])):
     r = int(key[1:])
     acc = next((g["macro_accuracy"] for g in sft["generation"] if g["loops"] == r and g["sampling"]["name"] == "greedy"), None)
     lines.append(f"| {r} | {value:.4f} | {'' if acc is None else f'{acc*100:.1f}%'} |")
