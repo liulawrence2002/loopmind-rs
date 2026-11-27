@@ -126,6 +126,35 @@ A reward is `beta * (log pi - log ref)` summed over an answer.
 - The loss was met by lowering both answers, the model's own samples faster than the references. A chosen reward of −0.8 at `beta` 0.1 is about 8 nats less log-probability per reference answer, or about 0.12 per token. That matches the 0.15-nat rise in held-out loss. The `nll_weight` 0.2 term did not hold the chosen answers in place. Falling chosen likelihood is a known DPO failure (Pal et al., 2024; Razin et al., 2024).
 - Changes to try next: a larger `nll_weight` (1.0, as in iterative RPO), a lower learning rate, or a few hundred steps instead of 960, since held-out accuracy was 0.82 at step 100 and never passed 0.86. The pairs in `runs/dpo/pairs.jsonl` can be reused.
 
+### DPO retry
+
+`configs/dpo-anchored.toml` retried DPO from the refinement pass on the same pairs, with:
+
+- `nll_weight` 1.0 instead of 0.2;
+- one epoch at 16 pairs per step: 240 steps instead of 960, the cosine schedule ending at step 240;
+- everything else as in the first run.
+
+It took 4.5 minutes, and the eval at r = 8 greedy took 16 more. It ran by hand, not through `scripts/refine.sh`, and was judged by the same keep rule.
+
+| Steps | Chosen reward | Rejected reward | Margin | Train pair accuracy |
+| --- | ---: | ---: | ---: | ---: |
+| 1–60 | −0.24 | −1.00 | 0.76 | 0.79 |
+| 61–120 | −0.35 | −1.55 | 1.20 | 0.84 |
+| 121–240 | −0.34 | −1.63 | 1.29 | 0.86 |
+
+| Checkpoint | Held-out loss, r = 4 | Held-out loss, r = 8 | Macro | Correct | math | logic | science | JSON exact | JSON valid |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| SFT + refinement pass (kept) | **1.008** | **1.051** | **16.1%** | **20** | 1/50 | 2/30 | 9/24 | 8/44 | 82% |
+| DPO, first run | 1.129 | 1.203 | 9.7% | 10 | 1/50 | 1/30 | 8/24 | 0/44 | 78% |
+| DPO retry | 1.051 | 1.102 | 11.6% | 15 | 5/50 | 2/30 | 6/24 | 2/44 | 80% |
+
+**Result: discarded.** It failed both parts of the keep rule:
+
+- held-out loss rose 0.051 at r = 8, just over the 0.05 limit;
+- macro accuracy fell 4.5 points.
+
+The stronger anchor and shorter run did cut the drift. The chosen reward averaged −0.34 instead of −0.77, and the loss rise was a third of the first run's. Held-out pair accuracy reached the same 0.84, with a smaller margin (0.85 against 1.76). Math rose from 1 to 5 of 50, but JSON fell from 8 to 2 of 44 and science from 9 to 6 of 24. With 148 scored rows, these per-config swings are a few answers each.
+
 ### Chat
 
 A 10M model gives fluent fragments, not answers. Two of the six smoke prompts, with the refinement-pass model at r = 8 greedy:
