@@ -102,10 +102,24 @@ The same change builds the RoPE tables and causal mask once per forward instead 
 | --- | ---: | ---: |
 | Throughput | ~4,100 tok/s (up to ~7,800 on an idle CPU) | ~12,000 tok/s (10,000–15,000) |
 | GPU utilization | ~40% | ~75–85% |
-| `nvidia-smi` memory | 7.4 GB | 6.7–7.6 GB |
+| `nvidia-smi` memory | 7.4 GB | 6.7–7.6 GB (4.4 GB after the fix below) |
 | `mfu` | ~0.85% | ~2.3% |
 
 At that rate an epoch is about 70 minutes.
+
+### Memory grew with `r`
+
+At step 5,701 the run ran out of device memory on an ordinary training step. Passes before the last `bptt_passes` were detached, but autodiff still kept their activations alive until backward, so memory grew with the sampled loop count. With a loop mean of 14, a synthetic run failed on its first step. The live run sat at ~7.6 GB, so a rare high-`r` sequence was enough.
+
+`recur` now runs those passes on the model's non-autodiff copy (`Module::valid`, `Tensor::inner`) and lifts the result back as a constant. Values and gradients are unchanged: those passes never received gradients. `passes_before_the_window_run_untracked_but_keep_the_values` checks the logits against the untruncated forward on an autodiff device.
+
+| Peak `nvidia-smi` memory | Before | After |
+| --- | ---: | ---: |
+| Loop mean 14 (r ≈ 13) | out of memory | 4.4 GB |
+| Loop mean 4, live run | 7.6 GB | 4.4 GB |
+| Loop mean 2 | 3.3 GB | 3.3 GB |
+
+Resumed from the step-5,600 checkpoint, steps 5,601–5,604 reproduced the crashed run's loss, grad norm, and loop counts to four decimals.
 
 ## Greedy samples
 

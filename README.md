@@ -153,7 +153,7 @@ DPO comes after these milestones.
 
 ## Hardware
 
-Development target is an NVIDIA GeForce RTX 4070 Laptop with 8 GB. Build that box with `--features cuda`. The model is about 10M parameters with a 1024-token context, which is the size aimed at that card. An f32 pretrain step on that card stays under 7.7 GB and, with the fused expert matmuls, runs at about 12,000 tok/s, so one epoch is about 70 minutes. The numbers are in [docs/pretrain.md](docs/pretrain.md).
+Development target is an NVIDIA GeForce RTX 4070 Laptop with 8 GB. Build that box with `--features cuda`. The model is about 10M parameters with a 1024-token context, which is the size aimed at that card. An f32 pretrain step on that card peaks at about 4.4 GB and, with the fused expert matmuls, runs at about 12,000 tok/s, so one epoch is about 70 minutes. The numbers are in [docs/pretrain.md](docs/pretrain.md).
 
 `wgpu` is the portable GPU feature for machines without CUDA. CI is CPU-only and uses Burn's `flex` backend. The toolchain is stable Rust (`rust-toolchain.toml`); Burn 0.22 sets the minimum at 1.95.
 

@@ -195,3 +195,26 @@ fn fused_experts_match_the_per_expert_loop() {
         }
     }
 }
+
+#[test]
+fn passes_before_the_window_run_untracked_but_keep_the_values() {
+    let device = Device::flex().autodiff();
+    device.seed(7);
+    let mut config = LoopMindConfig::tiny();
+    config.bptt_passes = 2;
+    let model = LoopMind::init(&config, &device).train();
+    let inputs = tokens(1, 6, &device);
+    let truncated = model.forward_train_at(inputs.clone(), 5, None);
+    let full = model.forward(inputs.clone(), 5);
+    assert!(max_abs_diff(&truncated.logits, &full.logits) < 1e-5);
+    assert!((scalar(&truncated.aux_loss) - scalar(&full.aux_loss)).abs() < 1e-6);
+    let loss = token_cross_entropy(truncated.logits, inputs);
+    let grads = loss.backward();
+    let core = &model.core[0].attn.q.weight;
+    let grad = core
+        .val()
+        .grad(&grads)
+        .expect("core weights get a gradient from the window");
+    let values = grad.into_data().try_into_vec::<f32>().unwrap();
+    assert!(values.iter().any(|value| *value != 0.0));
+}

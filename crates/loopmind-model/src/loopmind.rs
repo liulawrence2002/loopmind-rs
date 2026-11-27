@@ -169,32 +169,47 @@ impl LoopMind {
         force_routes: Option<Tensor<3, Int>>,
         ctx: &AttnContext,
     ) -> (Tensor<3>, Tensor<1>, Vec<Tensor<1>>) {
-        // The core is shared across passes, so its expert weights are concatenated once.
-        let fused: Vec<FusedExperts> = self.core.iter().map(|layer| layer.moe.fuse()).collect();
+        let tracked = loops.min(bptt);
+        let untracked = loops - tracked;
         let mut state = e.clone();
         let mut aux: Option<Tensor<1>> = None;
         let mut slot_sum: Vec<Tensor<1>> = Vec::new();
-        for pass in 0..loops {
+        if untracked > 0 {
+            // Passes before the backprop window get no gradient. Detaching their output was not
+            // enough: autodiff still held their activations until backward, so memory grew with
+            // `r` and an r = 14 sequence ran the 8 GB card out of memory. The plain copy of the
+            // model records nothing, and its output re-enters autodiff as a constant.
+            let plain = self.valid();
+            let plain_ctx = ctx.clone().inner();
+            let plain_fused: Vec<FusedExperts> =
+                plain.core.iter().map(|layer| layer.moe.fuse()).collect();
+            let plain_e = e.clone().inner();
+            let routes = force_routes.clone().map(Tensor::inner);
+            let mut plain_state = plain_e.clone();
+            let mut plain_aux: Option<Tensor<1>> = None;
+            for _ in 0..untracked {
+                let (core_out, pass_aux, pass_slots) =
+                    plain.apply_core(plain_state, routes.clone(), &plain_ctx, &plain_fused);
+                plain_aux = Some(add_aux(plain_aux, pass_aux));
+                slot_sum = add_slot_tensors(slot_sum, pass_slots);
+                plain_state = core_out + plain_e.clone();
+            }
+            let tracked_device = e.is_autodiff();
+            state = if tracked_device {
+                plain_state.autodiff()
+            } else {
+                plain_state
+            };
+            aux = plain_aux.map(|sum| if tracked_device { sum.autodiff() } else { sum });
+        }
+        // The core is shared across passes, so its expert weights are concatenated once.
+        let fused: Vec<FusedExperts> = self.core.iter().map(|layer| layer.moe.fuse()).collect();
+        for _ in 0..tracked {
             let (core_out, pass_aux, pass_slots) =
                 self.apply_core(state, force_routes.clone(), ctx, &fused);
-            slot_sum = if slot_sum.is_empty() {
-                pass_slots
-            } else {
-                slot_sum
-                    .into_iter()
-                    .zip(pass_slots)
-                    .map(|(sum, next)| sum + next)
-                    .collect()
-            };
-            let updated = core_out + e.clone();
-            let early = pass.saturating_add(bptt) < loops;
-            if early {
-                state = updated.detach();
-                aux = Some(add_aux(aux, pass_aux.detach()));
-            } else {
-                state = updated;
-                aux = Some(add_aux(aux, pass_aux));
-            }
+            slot_sum = add_slot_tensors(slot_sum, pass_slots);
+            aux = Some(add_aux(aux, pass_aux));
+            state = core_out + e.clone();
         }
         let aux = aux.unwrap_or_else(|| Tensor::<1>::zeros([1], &state.device()));
         (state, aux, slot_sum)
@@ -503,6 +518,16 @@ fn pick_token(logits: &[f32], options: &GenerateOptions, rng: &mut TrainRng) -> 
         draw -= weight;
     }
     order[order.len() - 1] as u32
+}
+
+fn add_slot_tensors(sum: Vec<Tensor<1>>, next: Vec<Tensor<1>>) -> Vec<Tensor<1>> {
+    if sum.is_empty() {
+        return next;
+    }
+    sum.into_iter()
+        .zip(next)
+        .map(|(sum, next)| sum.inner() + next.inner())
+        .collect()
 }
 
 fn add_aux(sum: Option<Tensor<1>>, next: Tensor<1>) -> Tensor<1> {

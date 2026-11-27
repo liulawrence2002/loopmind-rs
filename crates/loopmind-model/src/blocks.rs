@@ -114,6 +114,15 @@ impl AttnContext {
         }
     }
 
+    /// The same tables without autodiff, for passes that are not backpropagated.
+    pub(crate) fn inner(self) -> Self {
+        Self {
+            cos: self.cos.inner(),
+            sin: self.sin.inner(),
+            mask: self.mask.inner(),
+        }
+    }
+
     /// Match the dtype of the activations, so a bf16 model does not multiply by f32 tables.
     pub(crate) fn cast(self, dtype: burn::tensor::DType) -> Self {
         Self {
