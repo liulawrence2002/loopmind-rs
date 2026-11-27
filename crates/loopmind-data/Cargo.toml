@@ -6,4 +6,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "LoopMind pretrain mix and SFT selection rules. Loaders land in M3."
+description = "LoopMind pretrain and SFT shard builder and batch sampler."
+
+[dependencies]
+loopmind-tokenizer = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+sha2 = "0.10"
+toml = { workspace = true }

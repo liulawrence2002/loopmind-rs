@@ -45,6 +45,18 @@ enum Command {
         #[arg(long, default_value = "tokenizer/tokenizer.json")]
         tokenizer: PathBuf,
     },
+    /// Pack the pretrain mix into `u16` shards.
+    PreparePretrain {
+        /// Data config. Paths inside it are relative to the repo root.
+        #[arg(long, default_value = "configs/data.toml")]
+        config: PathBuf,
+    },
+    /// Render English FABLE chat into SFT shards and an eval file.
+    PrepareSft {
+        /// Data config. Paths inside it are relative to the repo root.
+        #[arg(long, default_value = "configs/data.toml")]
+        config: PathBuf,
+    },
     /// Pretrain on the 50M-token mix (M4).
     Pretrain,
     /// Supervised-finetune on English chat (M5).
@@ -119,6 +131,74 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        Command::PreparePretrain { config } => {
+            let started = std::time::Instant::now();
+            let config = load_data_config(config)?;
+            let tokenizer = LoopTokenizer::from_file(&config.tokenizer)?;
+            let manifest = loopmind_data::prepare_pretrain(&config, &tokenizer)?;
+            let train: u64 = manifest
+                .sources
+                .iter()
+                .map(|source| source.train_tokens)
+                .sum();
+            let val: u64 = manifest
+                .sources
+                .iter()
+                .map(|source| source.val_tokens)
+                .sum();
+            println!(
+                "pretrain packed {train} train tokens and {val} val tokens across {} sources in {:.1}s",
+                manifest.sources.len(),
+                started.elapsed().as_secs_f64()
+            );
+            println!(
+                "manifest: {}",
+                config.output_dir.join("pretrain/manifest.json").display()
+            );
+            for source in &manifest.sources {
+                println!(
+                    "  {} budget {} train {} ({} seq) val {} ({} seq) docs {}",
+                    source.name,
+                    source.budget_tokens,
+                    source.train_tokens,
+                    source.train_sequences,
+                    source.val_tokens,
+                    source.val_sequences,
+                    source.docs_seen
+                );
+            }
+        }
+        Command::PrepareSft { config } => {
+            let started = std::time::Instant::now();
+            let config = load_data_config(config)?;
+            let tokenizer = LoopTokenizer::from_file(&config.tokenizer)?;
+            let manifest = loopmind_data::prepare_sft(&config, &tokenizer)?;
+            println!(
+                "sft kept {} train rows and {} eval rows, dropped {} in {:.1}s",
+                manifest.kept_train,
+                manifest.kept_eval,
+                manifest.dropped.non_english
+                    + manifest.dropped.cc_by_sa
+                    + manifest.dropped.too_long
+                    + manifest.dropped.empty
+                    + manifest.dropped.no_assistant
+                    + manifest.dropped.bad_role,
+                started.elapsed().as_secs_f64()
+            );
+            println!(
+                "  non_english {}  cc_by_sa {}  too_long {}  empty {}  no_assistant {}  bad_role {}",
+                manifest.dropped.non_english,
+                manifest.dropped.cc_by_sa,
+                manifest.dropped.too_long,
+                manifest.dropped.empty,
+                manifest.dropped.no_assistant,
+                manifest.dropped.bad_role
+            );
+            println!(
+                "manifest: {}",
+                config.output_dir.join("sft/manifest.json").display()
+            );
+        }
         Command::Pretrain => {
             println!("{}", loopmind_train::pretrain_status());
             println!("pretrain mix: {} tokens", loopmind_data::pretrain_tokens());
@@ -149,6 +229,23 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn load_data_config(
+    path: PathBuf,
+) -> Result<loopmind_data::DataConfig, Box<dyn std::error::Error>> {
+    let path = find_file(path)?;
+    let mut config = loopmind_data::DataConfig::from_path(&path)?;
+    let root = path.parent().and_then(|dir| dir.parent()).ok_or_else(|| {
+        ConfigError::Invalid("data config is not inside a configs directory".into())
+    })?;
+    if config.tokenizer.is_relative() {
+        config.tokenizer = root.join(&config.tokenizer);
+    }
+    if config.output_dir.is_relative() {
+        config.output_dir = root.join(&config.output_dir);
+    }
+    Ok(config)
 }
 
 fn find_file(path: PathBuf) -> Result<PathBuf, ConfigError> {

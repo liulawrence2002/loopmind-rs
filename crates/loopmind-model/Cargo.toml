@@ -10,6 +10,7 @@ description = "LoopMind architecture, parameter census, and the Burn framework b
 
 [dependencies]
 burn = { workspace = true }
+loopmind-data = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 

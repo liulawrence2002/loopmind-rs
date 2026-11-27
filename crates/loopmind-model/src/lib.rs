@@ -1,8 +1,8 @@
 //! LoopMind architecture and parameter census.
 //!
-//! Burn is a dependency of this crate only. Tokenizer, data, and train code
-//! depend on the types exported here, not on Burn. An M1 Candle bakeoff stays
-//! behind the same boundary.
+//! Burn is a dependency of this crate only. The data crate returns plain
+//! token batches; [`pretrain_batch`] turns them into tensors. An M1 Candle bakeoff
+//! stays behind the same boundary.
 //!
 //! # Examples
 //!
@@ -14,6 +14,7 @@
 //! assert_eq!(census.active, 2_377_984);
 //! ```
 
+mod batches;
 mod blocks;
 mod config;
 mod framework;
@@ -25,6 +26,7 @@ mod rng;
 #[cfg(test)]
 mod model_tests;
 
+pub use batches::{pretrain_batch, sft_batch};
 pub use blocks::Mixture;
 pub use config::{ConfigError, LoopMindConfig};
 pub use framework::{compiled_backends, framework_name};

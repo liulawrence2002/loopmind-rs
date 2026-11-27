@@ -68,17 +68,19 @@ Pretrain, 50M tokens ([`loopmind-data`](crates/loopmind-data)):
 | FineWeb-Edu sample-10BT | 25M |
 | Cosmopedia-v2 (SmolLM corpus) | 10M |
 | TinyStories | 10M |
-| English Wikipedia rows from `KeremTT/FABLE-5.2-MAX-DATABASE`, column `raw_text_corpus` | 5M |
+| English `raw_text_corpus` rows from `KeremTT/FABLE-5.2-MAX-DATABASE` | 5M |
 
-SFT uses English chat rows of `KeremTT/FABLE-5.2-MAX-DATABASE`. Rows over 1024 tokens are dropped, Turkish rows are dropped, and 2,000 checkable rows are held out for eval. DPO is later and out of scope.
+Sequences are 1024 tokens, so this budget packs to 49,997,824 train tokens. The measured build (44.6s pretrain, 82.3s SFT, 153,517 train rows, 2,000 eval rows) is in [docs/data.md](docs/data.md).
+
+SFT uses English chat rows of `KeremTT/FABLE-5.2-MAX-DATABASE`. Rows over 1024 tokens are dropped, Turkish rows are dropped, and 2,000 checkable rows are held out for eval. CC-BY-SA rows stay unless `sft.exclude_cc_by_sa` is set. The builder, shard layout, and the ThinkPad command are in [docs/data.md](docs/data.md). DPO is later and out of scope.
 
 ## Crates
 
 | Crate | Role |
 | --- | --- |
-| `loopmind-model` | Config, parameter census, and Burn. The only crate allowed to depend on a tensor framework. |
+| `loopmind-model` | Config, parameter census, Burn forward, and the conversion of data batches into tensors. |
 | `loopmind-tokenizer` | Byte-level BPE, chat template, and assistant loss mask. |
-| `loopmind-data` | Pretrain mix and SFT rules (M3). |
+| `loopmind-data` | Pretrain and SFT shard builder, plus the batch sampler. No Burn dependency. |
 | `loopmind-train` | Pretrain and SFT drivers (M4, M5). Depends on the model crate, not on Burn. |
 | `loopmind` | `clap` CLI. |
 
@@ -99,7 +101,12 @@ cargo run -p loopmind -- params --config configs/default.toml
 cargo test --workspace
 ```
 
-`pretrain`, `sft`, and `chat` are stubs. Each prints the milestone that will implement it and exits 0. `pretrain` and `sft` also print the data plan.
+`pretrain`, `sft`, and `chat` are stubs. Each prints the milestone that will implement it and exits 0. `pretrain` and `sft` also print the data plan. Preparing the shards is separate:
+
+```bash
+cargo run -p loopmind --release -- prepare-pretrain --config configs/data.toml
+cargo run -p loopmind --release -- prepare-sft --config configs/data.toml
+```
 
 Train and use the tokenizer:
 
@@ -134,7 +141,7 @@ cargo run -p moe-bakeoff --release --features cuda   # RTX 4070 Laptop, needs th
 | M0 | Workspace, config, parameter census, CI. Done. |
 | M1 | Forward pass, gradient-coverage test, PyTorch parity on a tiny config, and a Burn vs Candle check. Done. See [docs/framework-decision.md](docs/framework-decision.md). |
 | M2 | 6400-vocab byte-level BPE, chat template, and loss mask. Done. See [docs/tokenizer.md](docs/tokenizer.md). |
-| M3 | Data pipeline for the pretrain mix and the English SFT split. |
+| M3 | Data pipeline for the pretrain mix and the English SFT split. Done. See [docs/data.md](docs/data.md). |
 | M4 | Pretrain loop: random `r` per sequence, truncated backprop through the last 4 passes. |
 | M5 | SFT and the chat CLI. |
 
