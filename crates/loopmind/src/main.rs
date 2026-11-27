@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use loopmind_model::{ConfigError, LoopMindConfig};
+use loopmind_tokenizer::{LoopTokenizer, TrainConfig};
 
 #[derive(Parser)]
 #[command(
@@ -20,8 +21,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Train the 6400-vocab BPE (M2).
-    TokenizeTrain,
+    /// Train the 6400-vocab BPE.
+    TokenizeTrain {
+        /// Training config. Corpus paths inside it are relative to the working directory.
+        #[arg(long, default_value = "configs/tokenizer.toml")]
+        config: PathBuf,
+    },
+    /// Encode text and print the ids plus the decoded round trip.
+    Tokenize {
+        /// Text to encode.
+        #[arg(long)]
+        text: String,
+        /// Path to tokenizer.json.
+        #[arg(long, default_value = "tokenizer/tokenizer.json")]
+        tokenizer: PathBuf,
+    },
+    /// Bytes per token on one `.txt` file per line of a held-out directory.
+    TokenizeStats {
+        /// Directory of held-out `.txt` files.
+        #[arg(long, default_value = "data/tokenizer/heldout")]
+        heldout: PathBuf,
+        /// Path to tokenizer.json.
+        #[arg(long, default_value = "tokenizer/tokenizer.json")]
+        tokenizer: PathBuf,
+    },
     /// Pretrain on the 50M-token mix (M4).
     Pretrain,
     /// Supervised-finetune on English chat (M5).
@@ -46,10 +69,55 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(cli: Cli) -> Result<(), ConfigError> {
+fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Command::TokenizeTrain => {
-            println!("{}", loopmind_tokenizer::train_status());
+        Command::TokenizeTrain { config } => {
+            let config_path = find_file(config)?;
+            let train_config = TrainConfig::from_path(&config_path)?;
+            let tokenizer = LoopTokenizer::train(&train_config)?;
+            println!(
+                "trained {} tokens -> {}",
+                tokenizer.vocab_size(),
+                train_config.output.display()
+            );
+        }
+        Command::Tokenize { text, tokenizer } => {
+            let path = find_file(tokenizer)?;
+            let tokenizer = LoopTokenizer::from_file(&path)?;
+            let ids = tokenizer.encode(&text)?;
+            println!(
+                "{}",
+                ids.iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            println!("{}", tokenizer.decode(&ids)?);
+        }
+        Command::TokenizeStats { heldout, tokenizer } => {
+            let path = find_file(tokenizer)?;
+            let tokenizer = LoopTokenizer::from_file(&path)?;
+            let heldout = find_dir(heldout)?;
+            let mut files: Vec<_> = std::fs::read_dir(&heldout)?.collect::<Result<Vec<_>, _>>()?;
+            files.sort_by_key(|entry| entry.file_name());
+            for entry in files {
+                let file = entry.path();
+                if file.extension().and_then(|ext| ext.to_str()) != Some("txt") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&file)?;
+                let Some(ratio) = tokenizer.bytes_per_token(&text)? else {
+                    continue;
+                };
+                println!(
+                    "{}\t{ratio:.4}\t{} bytes\t{} tokens",
+                    file.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("?"),
+                    text.len(),
+                    tokenizer.encode(&text)?.len()
+                );
+            }
         }
         Command::Pretrain => {
             println!("{}", loopmind_train::pretrain_status());
@@ -74,7 +142,8 @@ fn dispatch(cli: Cli) -> Result<(), ConfigError> {
             println!("chat is not implemented yet (planned for M5)");
         }
         Command::Params { config } => {
-            let (path, loaded) = load_config(config)?;
+            let path = find_file(config)?;
+            let loaded = LoopMindConfig::from_path(&path)?;
             println!("config: {}", path.display());
             print!("{}", loaded.report()?);
         }
@@ -82,28 +151,41 @@ fn dispatch(cli: Cli) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn load_config(path: PathBuf) -> Result<(PathBuf, LoopMindConfig), ConfigError> {
+fn find_file(path: PathBuf) -> Result<PathBuf, ConfigError> {
     if path.is_file() {
-        let loaded = LoopMindConfig::from_path(&path)?;
-        return Ok((path, loaded));
+        return Ok(path);
     }
-    if path == Path::new("configs/default.toml") {
-        if let Some(found) = find_up("configs/default.toml") {
-            let loaded = LoopMindConfig::from_path(&found)?;
-            return Ok((found, loaded));
+    if let Some(found) = find_up(&path) {
+        if found.is_file() {
+            return Ok(found);
         }
     }
     Err(ConfigError::Io(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        format!("config not found at {}", path.display()),
+        format!("file not found at {}", path.display()),
     )))
 }
 
-fn find_up(relative: &str) -> Option<PathBuf> {
+fn find_dir(path: PathBuf) -> Result<PathBuf, ConfigError> {
+    if path.is_dir() {
+        return Ok(path);
+    }
+    if let Some(found) = find_up(&path) {
+        if found.is_dir() {
+            return Ok(found);
+        }
+    }
+    Err(ConfigError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("directory not found at {}", path.display()),
+    )))
+}
+
+fn find_up(relative: &Path) -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
         let candidate = dir.join(relative);
-        if candidate.is_file() {
+        if candidate.exists() {
             return Some(candidate);
         }
         if !dir.pop() {
@@ -114,6 +196,8 @@ fn find_up(relative: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use loopmind_model::LoopMindConfig;
 
     #[test]
@@ -122,6 +206,9 @@ mod tests {
             loopmind_tokenizer::TARGET_VOCAB,
             LoopMindConfig::default().vocab_size
         );
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tokenizer/tokenizer.json");
+        let tokenizer = loopmind_tokenizer::LoopTokenizer::from_file(&path).unwrap();
+        assert_eq!(tokenizer.vocab_size(), LoopMindConfig::default().vocab_size);
     }
 
     #[test]
