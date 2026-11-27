@@ -108,7 +108,7 @@ cargo build --release -p loopmind --features cuda
 
 When `runs/eval/<run>.json` exists, the page shows that checkpoint's eval accuracy and its held-out loss at the chosen `r`. The text streams token by token. Esc or Stop ends an answer early, and the server stops generating for it. Settings are kept in the browser's local storage.
 
-**Send earlier turns** is off by default, so each message is answered on its own. The SFT data is single-turn: all 2,000 held-out rows have one user turn. With an earlier exchange in context, the model tends to copy its previous answer. Turn the setting on to test multi-turn chat. When it is on, the oldest turns are dropped, as in `chat`, once the prompt plus max tokens would pass the 1024-token context.
+**Send earlier turns** is off by default, so each message is answered on its own. SFT is mostly single-turn: 4.7% of train rows are multi-turn dialogues, and all 2,000 held-out rows have one user turn. With an earlier exchange in context, the model tends to copy its previous answer. Turn the setting on to test multi-turn chat. When it is on, the oldest turns are dropped, as in `chat`, once the prompt plus max tokens would pass the 1024-token context.
 
 On the 4070, with no KV cache, answers stream at about 24–35 tokens/s at r = 4 or 8, once the first answer has compiled the kernels. The server listens on 127.0.0.1 and refuses requests whose `Host` is not a local name. `--host 0.0.0.0` opens it to the network and turns that check off. One worker thread holds one checkpoint and answers one request at a time. Switching checkpoints reloads the weights, which takes about a second.
 
