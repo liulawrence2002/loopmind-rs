@@ -35,6 +35,10 @@ pub struct DropCounts {
     pub empty: u64,
     pub no_assistant: u64,
     pub bad_role: u64,
+    /// A user prompt matches a prompt from FABLE's checkable configs, where the eval rows
+    /// come from.
+    #[serde(default)]
+    pub eval_overlap: u64,
 }
 
 impl DropCounts {
@@ -46,6 +50,7 @@ impl DropCounts {
             empty: 0,
             no_assistant: 0,
             bad_role: 0,
+            eval_overlap: 0,
         }
     }
 }
@@ -57,6 +62,11 @@ pub struct ChatRow {
     pub license: String,
     pub language: String,
     pub messages: Vec<(String, String)>,
+    /// When the rendered row is too long, drop whole trailing turns until it fits and
+    /// ends on an assistant turn, instead of dropping the row.
+    pub trim_to_fit: bool,
+    /// The stream found a user prompt that is also a checkable-config prompt.
+    pub eval_overlap: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +76,9 @@ pub struct SftManifest {
     pub kept_train: u64,
     pub kept_eval: u64,
     pub dropped: DropCounts,
+    /// Kept rows that lost trailing turns to fit `max_tokens`.
+    #[serde(default)]
+    pub trimmed: u64,
     pub english_license_counts: BTreeMap<String, u64>,
     pub train_shards: Vec<ShardRecord>,
     pub eval_file: String,
@@ -79,6 +92,8 @@ struct StageHeader {
     rows_len: u64,
     index_len: u64,
     dropped: DropCounts,
+    #[serde(default)]
+    trimmed: u64,
     english_license_counts: BTreeMap<String, u64>,
     kept: u64,
     complete: bool,
@@ -119,6 +134,12 @@ pub fn prepare_sft(
         "--skip".to_string(),
         seen.to_string(),
     ];
+    if config.sft.smoltalk {
+        args.extend([
+            "--smoltalk-revision".to_string(),
+            config.revision("smoltalk")?.to_string(),
+        ]);
+    }
     if let Some(file) = &config.sft.minimind_file {
         args.extend([
             "--minimind-file".to_string(),
@@ -188,6 +209,7 @@ pub fn build_sft(
                 rows_len: 0,
                 index_len: 0,
                 dropped: DropCounts::new(),
+                trimmed: 0,
                 english_license_counts: BTreeMap::new(),
                 kept: 0,
                 complete: false,
@@ -275,6 +297,10 @@ fn consider_row(
         header.dropped.non_english += 1;
         return Ok(None);
     }
+    if row.eval_overlap {
+        header.dropped.eval_overlap += 1;
+        return Ok(None);
+    }
     *header
         .english_license_counts
         .entry(row.license.clone())
@@ -291,7 +317,7 @@ fn consider_row(
         header.dropped.cc_by_sa += 1;
         return Ok(None);
     }
-    let rendered = tokenizer.render_chat(&turns, false)?;
+    let mut rendered = tokenizer.render_chat(&turns, false)?;
     if rendered.ids.len() != rendered.loss_mask.len() {
         return Err(DataError::new("chat mask length does not match token ids"));
     }
@@ -300,8 +326,17 @@ fn consider_row(
         return Ok(None);
     }
     if rendered.ids.len() > max_tokens {
-        header.dropped.too_long += 1;
-        return Ok(None);
+        let trimmed = if row.trim_to_fit {
+            trim_to_fit(tokenizer, &mut turns, max_tokens)?
+        } else {
+            None
+        };
+        let Some(trimmed) = trimmed else {
+            header.dropped.too_long += 1;
+            return Ok(None);
+        };
+        header.trimmed += 1;
+        rendered = trimmed;
     }
     let tokens = rendered
         .ids
@@ -310,6 +345,31 @@ fn consider_row(
         .collect::<Result<Vec<_>, _>>()?;
     let mask = rendered.loss_mask.into_iter().map(u8::from).collect();
     Ok(Some(SftRow { tokens, mask }))
+}
+
+/// Drop whole trailing turns until the conversation fits in `max_tokens` and ends on an
+/// assistant turn. None when no assistant turn fits.
+fn trim_to_fit(
+    tokenizer: &LoopTokenizer,
+    turns: &mut Vec<ChatTurn>,
+    max_tokens: usize,
+) -> Result<Option<loopmind_tokenizer::ChatExample>, DataError> {
+    loop {
+        while turns
+            .last()
+            .is_some_and(|turn| turn.role != Role::Assistant)
+        {
+            turns.pop();
+        }
+        if turns.is_empty() {
+            return Ok(None);
+        }
+        let rendered = tokenizer.render_chat(turns, false)?;
+        if rendered.ids.len() <= max_tokens {
+            return Ok(Some(rendered));
+        }
+        turns.pop();
+    }
 }
 
 fn split_stage(
@@ -359,6 +419,7 @@ fn split_stage(
         kept_train,
         kept_eval: chosen.len() as u64,
         dropped: header.dropped.clone(),
+        trimmed: header.trimmed,
         english_license_counts: header.english_license_counts.clone(),
         train_shards: shards,
         eval_file: eval_path.to_string_lossy().into_owned(),
@@ -486,11 +547,14 @@ fn empty_row() -> ChatRow {
         license: String::new(),
         language: String::new(),
         messages: Vec::new(),
+        trim_to_fit: false,
+        eval_overlap: false,
     }
 }
 
 fn parse_row(line: &str) -> Option<ChatRow> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let flag = |name: &str| value.get(name).and_then(|flag| flag.as_bool()) == Some(true);
     let messages = value
         .get("messages")?
         .as_array()?
@@ -523,6 +587,8 @@ fn parse_row(line: &str) -> Option<ChatRow> {
             .unwrap_or("")
             .to_string(),
         messages: messages.collect(),
+        trim_to_fit: flag("trim_to_fit"),
+        eval_overlap: flag("eval_overlap"),
     })
 }
 
@@ -557,6 +623,7 @@ fn dropped_total(counts: &DropCounts) -> u64 {
         + counts.empty
         + counts.no_assistant
         + counts.bad_role
+        + counts.eval_overlap
 }
 
 fn write_header(path: &Path, header: &StageHeader) -> Result<(), DataError> {
@@ -633,6 +700,8 @@ mod tests {
                 .iter()
                 .map(|(role, content)| ((*role).to_string(), (*content).to_string()))
                 .collect(),
+            trim_to_fit: false,
+            eval_overlap: false,
         }
     }
 
@@ -775,5 +844,81 @@ mod tests {
         .unwrap();
         assert!(dropped.dropped.cc_by_sa >= 4);
         assert!(dropped.kept_train + dropped.kept_eval < manifest.kept_train + manifest.kept_eval);
+    }
+
+    #[test]
+    fn long_rows_lose_trailing_turns_only_when_allowed_and_overlap_is_dropped() {
+        let tokenizer = tokenizer();
+        let long_turn = "token ".repeat(60);
+        let chat = [
+            ("user", "first question"),
+            ("assistant", "first answer"),
+            ("user", long_turn.as_str()),
+            ("assistant", long_turn.as_str()),
+        ];
+        let mut trimmable = row("trim", "smoltalk", "MIT", "en", &chat);
+        trimmable.trim_to_fit = true;
+        let mut first_too_long = row(
+            "first-long",
+            "smoltalk",
+            "MIT",
+            "en",
+            &[
+                ("user", long_turn.as_str()),
+                ("assistant", long_turn.as_str()),
+            ],
+        );
+        first_too_long.trim_to_fit = true;
+        let mut overlap = row("overlap", "smoltalk", "MIT", "en", &chat[..2]);
+        overlap.eval_overlap = true;
+        let rows = vec![
+            row("strict", "general_instruction", "MIT", "en", &chat),
+            trimmable,
+            first_too_long,
+            overlap,
+        ];
+        let dir = temp_dir("trim");
+        let manifest = build_sft(
+            &dir,
+            &tokenizer,
+            96,
+            1,
+            false,
+            3,
+            "fp-trim",
+            rows.into_iter(),
+        )
+        .unwrap();
+        assert_eq!(manifest.trimmed, 1);
+        assert_eq!(manifest.dropped.too_long, 2);
+        assert_eq!(manifest.dropped.eval_overlap, 1);
+        assert_eq!(manifest.kept_train + manifest.kept_eval, 1);
+        let kept = shard::read_sft_shard(&dir.join("train").join("sft-00000.bin"))
+            .unwrap()
+            .into_iter()
+            .chain(
+                fs::read_to_string(dir.join("eval.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                        shard::SftRow {
+                            tokens: serde_json::from_value(value["tokens"].clone()).unwrap(),
+                            mask: serde_json::from_value(value["loss_mask"].clone()).unwrap(),
+                        }
+                    }),
+            )
+            .collect::<Vec<_>>();
+        let first_exchange = tokenizer
+            .render_chat(
+                &[
+                    ChatTurn::new(Role::User, "first question"),
+                    ChatTurn::new(Role::Assistant, "first answer"),
+                ],
+                false,
+            )
+            .unwrap();
+        let expected: Vec<u16> = first_exchange.ids.iter().map(|id| *id as u16).collect();
+        assert_eq!(kept[0].tokens, expected);
     }
 }

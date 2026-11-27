@@ -29,6 +29,10 @@ pub struct Revisions {
     /// the build fingerprint when unset, so configs without it keep their builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimind: Option<String>,
+    /// Commit of `HuggingFaceTB/smol-smoltalk`, for `sft.smoltalk`. Left out of the build
+    /// fingerprint when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smoltalk: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,6 +53,10 @@ pub struct SftConfig {
     /// missing. Its English rows are added to the SFT train split after FABLE's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimind_file: Option<PathBuf>,
+    /// Add the English train split of `HuggingFaceTB/smol-smoltalk` at
+    /// `revisions.smoltalk`, after MiniMind's rows. Long chats keep their first turns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub smoltalk: bool,
 }
 
 impl DataConfig {
@@ -84,6 +92,11 @@ impl DataConfig {
         if self.sft.max_tokens == 0 || self.sft.eval_rows == 0 {
             return Err(DataError::new("sft limits must be greater than 0"));
         }
+        if self.sft.smoltalk && self.revisions.smoltalk.is_none() {
+            return Err(DataError::new(
+                "sft.smoltalk needs revisions.smoltalk (a dataset commit)",
+            ));
+        }
         if self.sft.minimind_file.is_some() && self.revisions.minimind.is_none() {
             return Err(DataError::new(
                 "sft.minimind_file needs revisions.minimind (a dataset commit)",
@@ -113,6 +126,11 @@ impl DataConfig {
                 .minimind
                 .as_deref()
                 .ok_or_else(|| DataError::new("revisions.minimind is not set"))?,
+            "smoltalk" => self
+                .revisions
+                .smoltalk
+                .as_deref()
+                .ok_or_else(|| DataError::new("revisions.smoltalk is not set"))?,
             _ => return Err(DataError::new(format!("unknown source {source}"))),
         })
     }
@@ -141,6 +159,8 @@ mod tests {
             .minimind_file
             .as_ref()
             .is_some_and(|file| file.ends_with("sft_t2t_mini.jsonl")));
+        assert!(config.sft.smoltalk);
+        assert_eq!(config.revision("smoltalk").unwrap().len(), 40);
         assert_eq!(
             config.pretrain_budgets().map(|(_, tokens)| tokens),
             [25_000_000, 10_000_000, 10_000_000, 5_000_000]
@@ -154,9 +174,14 @@ mod tests {
         let mut config = DataConfig::from_path(&path).unwrap();
         config.sft.minimind_file = None;
         config.revisions.minimind = None;
+        config.sft.smoltalk = false;
+        config.revisions.smoltalk = None;
         let view = serde_json::to_string(&config).unwrap();
-        assert!(!view.contains("minimind"));
+        assert!(!view.contains("minimind") && !view.contains("smoltalk"));
         config.sft.minimind_file = Some("x.jsonl".into());
+        assert!(config.validate().is_err());
+        config.sft.minimind_file = None;
+        config.sft.smoltalk = true;
         assert!(config.validate().is_err());
     }
 }

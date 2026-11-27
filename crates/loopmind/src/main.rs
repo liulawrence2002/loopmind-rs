@@ -386,17 +386,23 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     + manifest.dropped.too_long
                     + manifest.dropped.empty
                     + manifest.dropped.no_assistant
-                    + manifest.dropped.bad_role,
+                    + manifest.dropped.bad_role
+                    + manifest.dropped.eval_overlap,
                 started.elapsed().as_secs_f64()
             );
             println!(
-                "  non_english {}  cc_by_sa {}  too_long {}  empty {}  no_assistant {}  bad_role {}",
+                "  non_english {}  cc_by_sa {}  too_long {}  empty {}  no_assistant {}  bad_role {}  eval_overlap {}",
                 manifest.dropped.non_english,
                 manifest.dropped.cc_by_sa,
                 manifest.dropped.too_long,
                 manifest.dropped.empty,
                 manifest.dropped.no_assistant,
-                manifest.dropped.bad_role
+                manifest.dropped.bad_role,
+                manifest.dropped.eval_overlap
+            );
+            println!(
+                "  trimmed to fit {}  (kept, with trailing turns dropped)",
+                manifest.trimmed
             );
             println!(
                 "manifest: {}",

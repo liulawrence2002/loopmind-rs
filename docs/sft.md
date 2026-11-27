@@ -71,6 +71,16 @@ Final answer: 8
 
 The reference answer is 12. The `chat` defaults add a repetition penalty of 1.1 and sampling for this reason.
 
+## The English mix run
+
+`configs/sft-mix.toml` runs the same recipe on the larger English mix from [data.md](data.md#sft): FABLE, MiniMind's English rows, and smol-smoltalk, all through the answer-based English check. It starts again from the pretrain checkpoint and writes to `runs/sft-mix`, so `runs/sft` and `runs/sft-refine` stay as they are. It runs one epoch, because the mix is several times larger.
+
+```bash
+runs/sft-mix-supervisor.sh   # resumes up to 5 times, then evaluates into runs/eval/sft-mix.json
+```
+
+The supervisor script is local, like `runs/sft-supervisor.sh`. After training, it evaluates on the same 2,000 held-out rows as `runs/eval/sft.json`: masked loss at r = 1, 2, 4, 8, 16, and greedy answers at r = 4 and 8.
+
 ## Chat
 
 ```bash

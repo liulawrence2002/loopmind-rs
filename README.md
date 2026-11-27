@@ -72,7 +72,7 @@ Pretrain, 50M tokens ([`loopmind-data`](crates/loopmind-data)):
 
 Sequences are 1024 tokens, so this budget packs to 49,997,824 train tokens. The measured build (44.6s pretrain, 82.3s SFT, 153,517 train rows, 2,000 eval rows) is in [docs/data.md](docs/data.md).
 
-SFT uses English chat rows of `KeremTT/FABLE-5.2-MAX-DATABASE`, plus the English rows of MiniMind's SFT mix (`jingyaogong/minimind_dataset`, `sft_t2t_mini.jsonl`; non-commercial, see [docs/data.md](docs/data.md#minimind)). Rows over 1024 tokens are dropped, Turkish rows are dropped, and 2,000 checkable rows are held out for eval. CC-BY-SA rows stay unless `sft.exclude_cc_by_sa` is set. The builder, shard layout, and the ThinkPad command are in [docs/data.md](docs/data.md). DPO pairs are generated from the same train split; see [docs/refine.md](docs/refine.md).
+SFT uses English chat rows of `KeremTT/FABLE-5.2-MAX-DATABASE`, plus the English rows of MiniMind's SFT mix (`jingyaogong/minimind_dataset`, `sft_t2t_mini.jsonl`; non-commercial, see [docs/data.md](docs/data.md#minimind)) and of `HuggingFaceTB/smol-smoltalk` (Apache-2.0), the SFT mix for SmolLM2-135M/360M. Every source passes an English-answer check. Rows over 1024 tokens are dropped, Turkish rows are dropped, and 2,000 checkable rows are held out for eval. CC-BY-SA rows stay unless `sft.exclude_cc_by_sa` is set. The builder, shard layout, and the ThinkPad command are in [docs/data.md](docs/data.md). DPO pairs are generated from the same train split; see [docs/refine.md](docs/refine.md).
 
 ## Crates
 

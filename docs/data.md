@@ -37,7 +37,30 @@ Shards are little-endian `u16` files (`vocab` is 6400). The header is magic `LMD
 
 ## SFT
 
-English chat rows from FABLE, excluding `raw_text_corpus` and the `turkish_language` config. `language` must be `en` or `english`. Rows are rendered with the M2 chat template (`<|bos|>`, role turns, `<|eos|>` when the transcript ends on an assistant turn). The loss mask is 1 on assistant content, the `<|im_end|>` that closes it, and that final `<|eos|>`.
+English chat rows from FABLE, excluding `raw_text_corpus` and the `turkish_language` config, then optionally MiniMind's and smol-smoltalk's English rows, in that order. A FABLE row's `language` must be `en` or `english`. Rows are rendered with the M2 chat template (`<|bos|>`, role turns, `<|eos|>` when the transcript ends on an assistant turn). The loss mask is 1 on assistant content, the `<|im_end|>` that closes it, and that final `<|eos|>`.
+
+### English only
+
+Every source goes through one English check, `language_of` in `python/stream_corpus.py`, before the Rust side keeps a row. The check judges the answers. A row is dropped as `non_english` when:
+
+- an assistant answer is more than 30% CJK characters;
+- an assistant answer is more than 30% other non-Latin script (Greek, Cyrillic, Arabic, Hebrew, Indic, Thai, Georgian);
+- an assistant answer of 15 or more words is mostly Spanish, French, German, Italian, Portuguese, or Dutch: function words from those languages are over 15% of its words, there are at least 4 different ones, and they outnumber English function words;
+- the whole conversation is more than 2% CJK.
+
+These pass: a name like 秦始皇, a π, or a Russian name inside an English answer; a list of Dutch names or Spanish restaurant names; and JSON. The 2% conversation line drops Chinese chats with short answers, and MiniMind's English rows whose tool definitions are in Chinese. Those rows sit at 2–10% CJK, while incidental characters stay under 2%.
+
+Applied to FABLE's English-tagged rows, the check drops 162 rows and none of the eval rows. They are French dialogue, code with Chinese comments, SQL on Chinese strings, and tool chats that answer in another language. FABLE rows must also be tagged `en`.
+
+Two stricter first versions were too broad. One checked prompts as well, at 0% CJK. The other used thresholds of 5% CJK and 10% other script in answers, with foreign function words at 5% of the words. They dropped 1,064 and 611 FABLE rows with English answers, mostly JSON, name lists, and answers that quote a name in its own script. They also changed the eval set.
+
+### Eval overlap
+
+While FABLE streams, the user prompts of its four checkable configs are collected. That is about 60,000 prompts, a superset of the eval rows. A MiniMind or smol-smoltalk row whose user prompt matches one is dropped, counted as `eval_overlap`. Prompts are compared after lowercasing and collapsing whitespace.
+
+### Long conversations
+
+FABLE rows over `sft.max_tokens` are dropped, as before. MiniMind and smol-smoltalk rows are trimmed instead: whole trailing turns are removed until the conversation fits and ends on an assistant answer. Rows trimmed this way are counted as `trimmed`. A row whose first answer alone does not fit is still `too_long`.
 
 ### MiniMind
 
@@ -53,16 +76,42 @@ When `sft.minimind_file` is set, the English rows of [MiniMind](https://github.c
 
 Each row is `{"conversations": [{"role", "content", ...}]}`. `python/stream_corpus.py` turns it into FABLE's form:
 
-- **Language:** MiniMind has no language field. A row is tagged `zh`, and dropped as non-English, when its rendered text has any CJK character. The tool definitions count as rendered text. That leaves English rows only, which suits the English tokenizer and pretraining: Chinese costs this byte-level BPE three tokens per character.
+- **Language:** MiniMind has no language field. The English check above runs on the rendered text, tool definitions included. Most rows are Chinese, and Chinese costs this byte-level BPE three tokens per character.
 - **Tools:** `tools` (JSON strings) go into the system turn as FABLE does it: FABLE's tool instruction, then `<tools>[...]</tools>`. Each `tool_calls` entry becomes `<tool_call>{"name", "arguments"}</tool_call>` in the assistant turn, and `tool` turns are wrapped in `<tool_response></tool_response>`.
 - **Reasoning:** `reasoning_content` is dropped, so the model learns the final answers.
 - **Empty answers:** a row with an empty assistant answer and no tool call is sent empty, and is counted as `empty`.
 
-The eval split is unchanged. It is drawn from FABLE's four checkable configs only, and MiniMind rows follow FABLE's in the stream, so `eval.jsonl` is byte-identical to the FABLE-only build.
+The eval split is drawn from FABLE's four checkable configs only, and the other sources follow FABLE's rows in the stream.
 
 The dataset card lists two licences, Apache-2.0 and CC-BY-NC-2.0, without saying which rows carry which. Treat a build that includes MiniMind as non-commercial. Its rows are recorded with the license string `apache-2.0 / cc-by-nc-2.0 (minimind_dataset)`.
 
-Kept conversations are at most `sft.max_tokens` (1024). Drop reasons recorded in the manifest: `non_english`, `cc_by_sa`, `too_long`, `empty`, `no_assistant`, `bad_role`. CC-BY-SA rows (license string containing `cc-by-sa`, case insensitive) are kept unless `sft.exclude_cc_by_sa` is true. `english_license_counts` counts every English row, including ones dropped later for length or license.
+### smol-smoltalk
+
+With `sft.smoltalk = true`, the train split of [smol-smoltalk](https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk) follows MiniMind's rows. It is the SFT mix Hugging Face used for SmolLM2-135M-Instruct and SmolLM2-360M-Instruct (Allal et al., 2025). It is a version of SmolTalk adapted for models under 1B parameters: shorter Magpie-Ultra conversations, no function calling, and no advanced math.
+
+| Setting | Value |
+| --- | --- |
+| Dataset | `HuggingFaceTB/smol-smoltalk`, Apache-2.0, `language: en` |
+| Revision | `revisions.smoltalk`, `f73fe857d519ff6ac5af2ea67c4d3834da7b8bcc` |
+| Files | `data/train-0000{0..3}-of-00004.parquet`, 460,341 rows. The stream fetches them once into the Hugging Face cache with `snapshot_download`. |
+| Config name | `smoltalk:<source>`, so the index keeps each row's source |
+
+| Source | Rows | Share |
+| --- | ---: | ---: |
+| smol-magpie-ultra-short | 270,838 | 58.8% |
+| self-oss-instruct | 48,071 | 10.4% |
+| openhermes-50k | 47,492 | 10.3% |
+| smol-contraints | 34,433 | 7.5% |
+| smollm-rewrite-30k | 26,657 | 5.8% |
+| smol-summarize-20k | 19,272 | 4.2% |
+| smol-summarize-5k | 4,749 | 1.0% |
+| longalign | 3,560 | 0.8% |
+| explore-instruct-rewrite | 3,017 | 0.7% |
+| everyday-conversations | 2,252 | 0.5% |
+
+Before the build, 1,267 rows (0.3%) failed the English check, mostly in openhermes-50k: translations and tasks in other languages. 27 rows repeated an eval prompt. 59% of rows are three-turn Magpie chats. Only 47% of rows are under about 3,300 characters, which is roughly 1,024 tokens, so trimming keeps the rest as their opening turns.
+
+Kept conversations are at most `sft.max_tokens` (1024). Drop reasons recorded in the manifest: `non_english`, `cc_by_sa`, `too_long`, `empty`, `no_assistant`, `bad_role`, `eval_overlap`; `trimmed` counts kept rows that lost trailing turns. CC-BY-SA rows (license string containing `cc-by-sa`, case insensitive) are kept unless `sft.exclude_cc_by_sa` is true. `english_license_counts` counts every English row, including ones dropped later for length or license.
 
 Eval holds out `sft.eval_rows` (2000) checkable rows: `math_reasoning`, `logic_reasoning`, `science_knowledge`, and `structured_output`, 500 from each config, the lowest stable hashes first. If one config is short, the remainder is filled from the other three. Those rows are not in the train shards. `sft/eval.jsonl` stores `id`, `config`, `license`, `reference` (last assistant text), `tokens`, and `loss_mask`.
 
@@ -152,6 +201,47 @@ Measured on the 4070 box, 2026-11-27, with `sft.minimind_file = "data/raw/minimi
 - The English MiniMind rows are general instruction and chat. 98% are single-turn (100,586 of 102,502). One has a tool call.
 - `eval.jsonl` has the same SHA-256 as the FABLE-only build (`1c17344a…`).
 - An SFT epoch is 15,978 steps of 16 rows, up from 9,595.
+
+### With MiniMind and smol-smoltalk
+
+This is the build `configs/data.toml` makes now, with `sft.minimind_file` and `sft.smoltalk = true`, measured on the 4070 box on 2026-11-27. It took 960.7 s. Most of that is the Rust side re-rendering long chats while it trims them.
+
+| Outcome | Rows |
+| --- | ---: |
+| seen | 1,566,059 |
+| kept train | 699,885 |
+| kept eval | 2,000 |
+| dropped non_english | 829,868 |
+| dropped too_long | 28,473 |
+| dropped eval_overlap | 5,800 |
+| dropped empty | 33 |
+| trimmed to fit, kept | 220,971 |
+
+| Train split | Rows | Tokens | Mean tokens | Padded to 64 | Share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FABLE | 153,396 | 51.0M | 332 | 55.9M | 15.1% |
+| MiniMind | 99,265 | 22.1M | 222 | 25.2M | 6.8% |
+| smol-smoltalk | 447,224 | 276.0M | 617 | 289.9M | 78.1% |
+| total | 699,885 | 349.1M | 499 | 371.0M | |
+
+smol-smoltalk rows kept, by source:
+
+| Source | Rows kept |
+| --- | ---: |
+| smol-magpie-ultra-short | 270,563 |
+| self-oss-instruct | 47,648 |
+| openhermes-50k | 43,059 |
+| smol-contraints | 34,222 |
+| smollm-rewrite-30k | 26,646 |
+| smol-summarize-20k | 15,114 |
+| smol-summarize-5k | 4,703 |
+| explore-instruct-rewrite | 3,017 |
+| everyday-conversations | 2,252 |
+| longalign | 0 |
+
+All `longalign` rows are long-document tasks whose first answer alone is over 1,024 tokens. `eval.jsonl` is byte-identical to the FABLE-only build. An SFT epoch is 43,743 steps of 16 rows.
+
+`prepare-sft` checks the build fingerprint, which covers `configs/data.toml` and the tokenizer but not `python/stream_corpus.py`. After changing the stream script, delete `data/prepared/sft` before rebuilding.
 
 ## Running it on the ThinkPad
 
