@@ -4,7 +4,7 @@
 
 LoopMind is a tiny English-first language model trained end to end in Rust. The pipeline follows [MiniMind](https://github.com/jingyaogong/minimind): train a tokenizer, pretrain, supervised-finetune, then chat. The network is a Huginn-style recurrent-depth transformer whose shared core is a fine-grained mixture of experts.
 
-M0 is the workspace, config, parameter census, and CI. M1 is the Burn forward pass, gradient checks, a PyTorch parity test, and a one-layer Burn vs Candle timing check. The pretrain loop is still M4.
+M0 is the workspace, config, parameter census, and CI. M1 is the Burn forward pass, gradient checks, a PyTorch parity test, and a one-layer Burn vs Candle timing check. M2 is the tokenizer, M3 the data pipeline, and M4 the pretrain loop.
 
 The training pipeline is inspired by Jingyao Gong's [MiniMind](https://github.com/jingyaogong/minimind). The recurrence follows Huginn ([Geiping et al., 2025](https://arxiv.org/abs/2502.05171)): a prelude, a core that loops at train time and at inference time, and a coda. The wide, sparse expert layers follow MoEUT (Csordás et al., NeurIPS 2024; [code](https://github.com/RobertCsordas/moeut)). LoopMind uses ordinary grouped-query attention and SwiGLU experts. MoEUT routes attention as well, and its experts are ReLU.
 
@@ -151,7 +151,7 @@ DPO comes after these milestones.
 
 ## Hardware
 
-Development target is an NVIDIA GeForce RTX 4070 Laptop with 8 GB. Build that box with `--features cuda`. The model is about 10M parameters with a 1024-token context, which is the size aimed at that card. M4 still has to budget activation memory for the four backprop passes through the core.
+Development target is an NVIDIA GeForce RTX 4070 Laptop with 8 GB. Build that box with `--features cuda`. The model is about 10M parameters with a 1024-token context, which is the size aimed at that card. An f32 pretrain step on that card holds at about 7.4 GB and runs at about 4,100 tok/s, so one epoch is about 3.5 hours. The numbers are in [docs/pretrain.md](docs/pretrain.md).
 
 `wgpu` is the portable GPU feature for machines without CUDA. CI is CPU-only and uses Burn's `flex` backend. The toolchain is stable Rust (`rust-toolchain.toml`); Burn 0.22 sets the minimum at 1.95.
 

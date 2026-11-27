@@ -23,9 +23,15 @@ Checkpoints land in `runs/pretrain/checkpoints/step-NNNNNNNN/` and contain `mode
 
 `--device cpu` uses Burn's flex backend in f32. That is what CI uses.
 
-`--device cuda` needs a binary built with `--features cuda`. On CUDA the run tries a bf16 matmul, then f16, and stays on f32 if those values are not finite. The weights are stored in the dtype that worked. Burn updates those tensors in place, so this is not a separate f32 master-weight mixed-precision optimizer. `--device wgpu` needs `--features wgpu` and stays on f32.
+`--device cuda` needs a binary built with `--features cuda`. `--device wgpu` needs `--features wgpu`. Both train in f32 by default.
 
-There is no GPU on the machine that produced the smoke numbers below, so that probe was not executed here.
+`precision` in `configs/pretrain.toml` is `"f32"` (the default) or `"auto"`. With `"auto"`, a CUDA run tries a bf16 matmul, then f16, and casts every weight to the first dtype that returns finite values. Burn then updates those tensors in place, so there is no f32 master copy. On the RTX 4070 Laptop, `"auto"` picked bf16 and the first microbatch's loss was not finite. Even with a finite loss it would be a poor trade on this model:
+
+- An RMSNorm gain starts at 1.0, where half a bf16 ulp is about 0.004. An AdamW step is about `lr`, at most 3e-4, so the gains would never move.
+- Decoupled weight decay at `lr * 0.1` scales each weight by about `1 - 3e-5`, which rounds back to 1 in bf16.
+- Near the end of the cosine (`lr` 3e-5), most updates to the matrices are below half an ulp as well.
+
+The model is 10M parameters, so f32 weights plus AdamW state are about 160 MB. Memory goes to activations, not weights. The run is launch-bound (below), so f32 costs little throughput.
 
 ## Defaults for the ThinkPad
 
@@ -40,11 +46,14 @@ There is no GPU on the machine that produced the smoke numbers below, so that pr
 | `learning_rate` | 3e-4 | cosine floor 3e-5, warmup 100 steps |
 | `grad_clip` | 1.0 | global L2 |
 | `val_every` | 200 | 16 val sequences at r = 1, 2, 4, and 8 |
+| `precision` | f32 | see above |
 | `peak_tflops` | 15 | FP32 peak used for the MFU line |
 
 The active checkpoint is about 10M parameters. Activations dominate. The core is re-routed every pass and every expert is evaluated, so a microbatch of 1 at 1024 tokens is the comfortable setting; raise `micro_batch` only after watching memory.
 
 A fresh uniform model should start near `ln(6400)` ≈ 8.76 nats. A run that is learning leaves the high 8s during warmup and is in the 4s–6s by the end of this epoch. Validation at r = 1, 2, 4, 8 is the loop-depth dial: after pretraining, a higher `r` should not be wildly worse, and r = 4 is the training mean.
+
+Validation and `sample` run on the model's non-autodiff copy (`Module::valid`). On the training device, an untruncated r = 8 forward would keep all eight passes' activations alive, twice the four backprop passes a training step holds. The first 4070 run did that and ran out of device memory in the step-200 validation, before the step-200 checkpoint was written. With `valid`, validating every step on the same card peaks at 5.6 GB.
 
 ## Smoke run
 
@@ -62,14 +71,22 @@ This VM has no GPU. A release `--device cpu` run of `configs/pretrain.toml` got 
 
 The kill was an out-of-memory SIGKILL at about 15 GB. Each microbatch's autograd tape stayed alive because the accumulated gradients still pointed at it, so RSS climbed by tens of MB every step. Gradients are now detached before they are accumulated. A follow-up 12-step run on the same shards logged the same early losses (step 1 was 8.997 again) and, while a step was in flight, sat around 4.0–4.7 GB instead of climbing without bound. One 1024-token backward is large; it fits in 8 GB at `micro_batch = 1`.
 
-## 4070 estimate
+## RTX 4070 Laptop
 
-There is no CUDA device here, so this is an extrapolation. The CPU does about 300 tokens/s. The same step is a long chain of small expert kernels, so the laptop 4070 will not hit the 15 TFLOP/s peak; the logged MFU is there to show that. A 15–40× speedup over this CPU is the plausible band for that unfused loop, about **5,000–12,000 tokens/s**. The epoch is 48,826 sequences, 6,104 optimizer steps, ~50M tokens:
+Measured on the dev box: RTX 4070 Laptop (8 GB, driver 550, CUDA 12.5 toolkit), release `--features cuda`, `configs/pretrain.toml` with `precision = "f32"`.
 
-- 5,000 tok/s → about 3 hours
-- 12,000 tok/s → about 70 minutes
+| | Value |
+| --- | ---: |
+| Throughput, first 144 steps | 4,091 tok/s mean, about 2.0 s per 8,192-token step |
+| Range per step | about 3,400–5,600 tok/s; longer sampled `r` is slower |
+| `nvidia-smi` memory | 6.7 GB by step 6, flat at 7.4 GB from step ~77 |
+| GPU utilization | about 40% |
+| `mfu` | about 0.85% of 15 TFLOP/s |
+| Epoch | 6,104 steps, about 3.5 hours |
 
-Plan on **1–3 hours** for the epoch. The first CUDA log line should be a few hundred milliseconds to a couple of seconds per step, not the ~26 s seen here, and `nvidia-smi` memory should stay under 8 GB. If a step is still many seconds, the expert loop is launch-bound and the run is still correct, just slower than the optimistic end of that range.
+The early curve matches the CPU smoke below: loss 7.146 at step 100 (CPU 7.140) and 6.765 at step 150 (CPU 6.752).
+
+The GPU sits at ~40% because the step is launch-bound. Each core layer evaluates all 32 experts as separate `[1024, 256] × [256, 128]` SwiGLUs, about 100 small matmuls per layer per pass, plus a host read of the expert-slot fractions after every layer. Concatenating the expert weights into one `[256, 4096]` gate/up and one `[4096, 256]` down gives the same output and gradients with three large matmuls. That is the obvious next speedup. It does not change the checkpoint.
 
 ## Greedy samples
 

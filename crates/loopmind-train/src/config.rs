@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use loopmind_model::LoopMindConfig;
+use loopmind_model::{LoopMindConfig, Precision};
 use serde::{Deserialize, Serialize};
 
 use crate::TrainError;
@@ -17,6 +17,9 @@ pub struct PretrainConfig {
     pub epochs: u64,
     pub max_steps: u64,
     pub device: String,
+    /// `f32` (default) or `auto`, which lets CUDA pick bf16 or f16 weights.
+    #[serde(default = "default_precision")]
+    pub precision: String,
     pub peak_tflops: f64,
     pub optim: OptimConfig,
     pub batch: BatchConfig,
@@ -92,6 +95,7 @@ impl PretrainConfig {
         if self.checkpoint.keep == 0 {
             return Err(TrainError::new("checkpoint.keep must be at least 1"));
         }
+        Precision::parse(&self.precision).map_err(TrainError::new)?;
         if self.peak_tflops <= 0.0 {
             return Err(TrainError::new("peak_tflops must be greater than 0"));
         }
@@ -106,6 +110,10 @@ impl PretrainConfig {
     pub fn load_model(&self) -> Result<LoopMindConfig, TrainError> {
         Ok(LoopMindConfig::from_path(&self.model)?)
     }
+}
+
+fn default_precision() -> String {
+    "f32".to_string()
 }
 
 impl From<std::io::Error> for TrainError {
@@ -142,5 +150,6 @@ mod tests {
         assert_eq!(config.val_loops, vec![1, 2, 4, 8]);
         assert!((config.optim.learning_rate - 3.0e-4).abs() < 1e-12);
         assert_eq!(config.checkpoint.keep, 2);
+        assert_eq!(config.precision, "f32");
     }
 }
