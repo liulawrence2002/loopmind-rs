@@ -17,13 +17,16 @@ static INIT_RNG: Mutex<()> = Mutex::new(());
 
 use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
 use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams};
+use burn::tensor::activation::log_sigmoid;
 use burn::tensor::{DType, Device, Tensor};
 use loopmind_data::{PretrainBatch, SftBatch};
 
 use crate::batches::{pretrain_batch, sft_batch};
 use crate::config::LoopMindConfig;
-use crate::loopmind::{greedy_continue, sample_continue, GenerateOptions, LoopMind};
-use crate::loss::{masked_shifted_nll_sum, shifted_token_cross_entropy};
+use crate::loopmind::{greedy_continue, sample_batch, sample_continue, GenerateOptions, LoopMind};
+use crate::loss::{
+    masked_shifted_logprob_rows, masked_shifted_nll_sum, shifted_token_cross_entropy,
+};
 use crate::rng::TrainRng;
 
 /// Where the run executes.
@@ -106,6 +109,22 @@ pub struct SftStats {
     pub tokens: u64,
 }
 
+/// Result of one DPO pair backward. Rewards are `beta * (log pi - log ref)` of a response.
+#[derive(Debug, Clone)]
+pub struct DpoStats {
+    /// `-log sigmoid(margin)`.
+    pub loss: f32,
+    /// `chosen_reward - rejected_reward`.
+    pub margin: f32,
+    pub chosen_reward: f32,
+    pub rejected_reward: f32,
+    /// Token-mean NLL of the chosen response under the policy.
+    pub chosen_nll: f32,
+    pub aux: f32,
+    pub loops: usize,
+    pub tokens: u64,
+}
+
 /// Result of the optimizer step that consumes accumulated gradients.
 #[derive(Debug, Clone, Copy)]
 pub struct ApplyStats {
@@ -114,6 +133,8 @@ pub struct ApplyStats {
 
 pub struct PretrainEngine {
     model: Option<LoopMind>,
+    /// Frozen DPO reference on the plain device. `None` outside DPO.
+    reference: Option<LoopMind>,
     optim: burn::optim::ModuleOptimizer,
     accumulator: GradientsAccumulator<LoopMind>,
     pending: u32,
@@ -151,6 +172,7 @@ impl PretrainEngine {
             pending: 0,
             rng: TrainRng::new(seed ^ 0xD1CE_5EED),
             model: Some(model),
+            reference: None,
             device,
             precision,
             kind,
@@ -181,6 +203,7 @@ impl PretrainEngine {
             .map_err(|error| error.to_string())?;
         Ok(Self {
             model: Some(model),
+            reference: None,
             optim,
             accumulator: GradientsAccumulator::new(),
             pending: 0,
@@ -219,6 +242,7 @@ impl PretrainEngine {
         }
         Ok(Self {
             model: Some(model),
+            reference: None,
             optim: adamw(settings),
             accumulator: GradientsAccumulator::new(),
             pending: 0,
@@ -378,6 +402,130 @@ impl PretrainEngine {
         Ok((nll.into_scalar::<f32>(), batch.supervised_targets()))
     }
 
+    /// Per-row masked NLL sums at a fixed `r`, without an autodiff graph. Rows share a width.
+    pub fn nll_rows(&self, batch: &SftBatch, loops: usize) -> Result<Vec<f32>, String> {
+        let (tokens, mask) = sft_batch(batch, &self.plain_device());
+        let out = self.net().valid().forward(tokens.clone(), loops);
+        masked_shifted_logprob_rows(out.logits, tokens, mask)
+            .neg()
+            .cast(DType::F32)
+            .into_data()
+            .try_into_vec::<f32>()
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    /// Freeze the weights at `model_path` as the DPO reference, on the plain device.
+    pub fn load_reference(&mut self, model_path: &Path) -> Result<(), String> {
+        let device = self.plain_device();
+        let mut reference = LoopMind::init(self.config(), &device)
+            .try_load_file(model_path)
+            .map_err(|error| error.to_string())?;
+        if let Some(dtype) = dtype_of(&self.precision) {
+            reference = cast_parameters(reference, dtype);
+        }
+        self.reference = Some(reference.valid());
+        Ok(())
+    }
+
+    /// One DPO pair. Row 0 of `pair` is the chosen response, row 1 the rejected one.
+    ///
+    /// Both rows and the reference share one sampled loop count, so `r` cancels out of
+    /// the log-ratio. The backward loss is
+    /// `scale * (dpo + nll_weight * chosen token-mean NLL) + aux_scale * aux`;
+    /// call [`PretrainEngine::apply_summed`] after the step's pairs.
+    pub fn accumulate_dpo(
+        &mut self,
+        pair: &SftBatch,
+        beta: f32,
+        nll_weight: f32,
+        scale: f32,
+        aux_scale: f32,
+    ) -> Result<DpoStats, String> {
+        if pair.batch != 2 || pair.seq_len < 2 {
+            return Err("a DPO pair is two rows of at least 2 tokens".into());
+        }
+        let targets = pair.targets_per_row();
+        let config = self.config().clone();
+        let mut rng = self.rng.clone();
+        let loops = rng.sample_loops(config.loop_count_mean, config.loop_count_max);
+        self.rng = rng;
+        let reference_lp = self.reference_logprobs(pair, loops)?;
+        let (tokens, mask) = sft_batch(pair, &self.device);
+        let model = self.model.as_ref().expect("model is loaded");
+        let out = model.forward_train_at(tokens.clone(), loops, None);
+        let policy = masked_shifted_logprob_rows(out.logits, tokens, mask);
+        let reference_lp = if self.device.is_autodiff() {
+            reference_lp.autodiff()
+        } else {
+            reference_lp
+        };
+        let ratio = policy.clone() - reference_lp;
+        let chosen = ratio.clone().narrow(0, 0, 1).mul_scalar(beta);
+        let rejected = ratio.narrow(0, 1, 1).mul_scalar(beta);
+        let margin = chosen.clone() - rejected.clone();
+        let dpo = log_sigmoid(margin.clone()).neg();
+        let chosen_nll = policy
+            .narrow(0, 0, 1)
+            .neg()
+            .div_scalar(targets[0].max(1) as f32);
+        let aux = out.aux_loss;
+        let values = read_values(&[&dpo, &margin, &chosen, &rejected, &chosen_nll, &aux]);
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(format!("dpo values are not finite: {values:?}"));
+        }
+        let loss =
+            (dpo + chosen_nll.mul_scalar(nll_weight)).mul_scalar(scale) + aux.mul_scalar(aux_scale);
+        self.backward(loss);
+        Ok(DpoStats {
+            loss: values[0],
+            margin: values[1],
+            chosen_reward: values[2],
+            rejected_reward: values[3],
+            chosen_nll: values[4],
+            aux: values[5],
+            loops,
+            tokens: (pair.batch * pair.seq_len) as u64,
+        })
+    }
+
+    /// DPO loss and margin of one pair at a fixed `r`, without an autodiff graph.
+    pub fn validate_dpo(
+        &self,
+        pair: &SftBatch,
+        beta: f32,
+        loops: usize,
+    ) -> Result<(f32, f32), String> {
+        let reference_lp = self.reference_logprobs(pair, loops)?;
+        let (tokens, mask) = sft_batch(pair, &self.plain_device());
+        let out = self.net().valid().forward(tokens.clone(), loops);
+        let ratio = masked_shifted_logprob_rows(out.logits, tokens, mask) - reference_lp;
+        let margin = (ratio.clone().narrow(0, 0, 1) - ratio.narrow(0, 1, 1)).mul_scalar(beta);
+        let dpo = log_sigmoid(margin.clone()).neg();
+        let values = read_values(&[&dpo, &margin]);
+        Ok((values[0], values[1]))
+    }
+
+    fn reference_logprobs(&self, pair: &SftBatch, loops: usize) -> Result<Tensor<1>, String> {
+        let reference = self
+            .reference
+            .as_ref()
+            .ok_or("load_reference before a DPO step")?;
+        let (tokens, mask) = sft_batch(pair, &self.plain_device());
+        let logits = reference.forward(tokens.clone(), loops).logits;
+        Ok(masked_shifted_logprob_rows(logits, tokens, mask))
+    }
+
+    /// Sampled continuations of equal-length prompts in one batch. See [`sample_batch`].
+    pub fn generate_batch(
+        &self,
+        prompts: &[Vec<u32>],
+        options: &GenerateOptions,
+        stop: &[u32],
+    ) -> Vec<Vec<u32>> {
+        let device = self.plain_device();
+        sample_batch(&self.net().valid(), prompts, options, stop, &device)
+    }
+
     pub fn greedy(&self, ids: Vec<u32>, loops: usize, max_new: usize, eos: u32) -> Vec<u32> {
         let device = self.plain_device();
         greedy_continue(&self.net().valid(), ids, loops, max_new, eos, &device)
@@ -527,6 +675,20 @@ fn grad_norm(model: &LoopMind, grads: &GradientsParams) -> f32 {
         .sqrt()
 }
 
+/// Scalars in one device read.
+fn read_values(values: &[&Tensor<1>]) -> Vec<f32> {
+    Tensor::cat(
+        values
+            .iter()
+            .map(|value| (*value).clone().detach().inner().cast(DType::F32))
+            .collect(),
+        0,
+    )
+    .into_data()
+    .try_into_vec::<f32>()
+    .expect("scalars are f32")
+}
+
 /// Two scalars in one device read.
 fn read_pair(first: &Tensor<1>, second: &Tensor<1>) -> [f32; 2] {
     let values = Tensor::cat(
@@ -579,6 +741,85 @@ fn scale_grads(model: &LoopMind, grads: &mut GradientsParams, scale: f32) {
 mod tests {
     use super::*;
     use burn::tensor::{Int, TensorData};
+
+    fn settings() -> OptimSettings {
+        OptimSettings {
+            weight_decay: 0.0,
+            beta1: 0.9,
+            beta2: 0.95,
+            epsilon: 1.0e-8,
+            grad_clip: 1.0,
+        }
+    }
+
+    #[test]
+    fn batched_greedy_matches_one_prompt_at_a_time() {
+        let engine = PretrainEngine::new(
+            &LoopMindConfig::tiny(),
+            3,
+            EngineDevice::Cpu,
+            settings(),
+            Precision::F32,
+        )
+        .unwrap();
+        let options = GenerateOptions {
+            loops: 3,
+            max_new: 6,
+            temperature: 0.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            seed: 0,
+        };
+        let prompts = vec![vec![1, 5, 9, 2], vec![7, 3, 3, 8]];
+        let batched = engine.generate_batch(&prompts, &options, &[]);
+        for (prompt, row) in prompts.iter().zip(&batched) {
+            assert_eq!(&engine.generate(prompt.clone(), &options, &[]), row);
+            assert_eq!(row.len(), 6);
+        }
+    }
+
+    #[test]
+    fn dpo_starts_at_ln2_and_widens_the_margin() {
+        use loopmind_data::SftRow;
+        let config = LoopMindConfig::tiny();
+        let mut engine =
+            PretrainEngine::new(&config, 4, EngineDevice::Cpu, settings(), Precision::F32).unwrap();
+        let dir = std::env::temp_dir().join(format!("loopmind-dpo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        engine
+            .save(&dir.join("model.bpk"), &dir.join("optim.bpk"))
+            .unwrap();
+        engine.load_reference(&dir.join("model.bpk")).unwrap();
+        let pair = SftBatch::from_rows(
+            &[
+                SftRow {
+                    tokens: vec![0, 3, 10, 11, 40, 41, 4, 1],
+                    mask: vec![0, 0, 0, 0, 1, 1, 1, 1],
+                },
+                SftRow {
+                    tokens: vec![0, 3, 10, 11, 60, 61, 62],
+                    mask: vec![0, 0, 0, 0, 1, 1, 1],
+                },
+            ],
+            2,
+            4,
+        );
+        let first = engine.accumulate_dpo(&pair, 0.5, 0.0, 1.0, 0.0).unwrap();
+        assert!(
+            (first.loss - std::f32::consts::LN_2).abs() < 1e-4,
+            "{first:?}"
+        );
+        assert!(first.margin.abs() < 1e-4, "{first:?}");
+        engine.apply_summed(1.0e-2).unwrap();
+        let mut last = first;
+        for _ in 0..15 {
+            last = engine.accumulate_dpo(&pair, 0.5, 0.0, 1.0, 0.0).unwrap();
+            engine.apply_summed(1.0e-2).unwrap();
+        }
+        assert!(last.margin > 0.5, "{last:?}");
+        let (val_loss, val_margin) = engine.validate_dpo(&pair, 0.5, 2).unwrap();
+        assert!(val_loss < std::f32::consts::LN_2 && val_margin > 0.0);
+    }
 
     /// Every f32 helper tensor (RoPE tables, expert one-hot, slot fractions) must be
     /// cast to the weights' dtype. On flex a mix panics; on CUDA it read as garbage

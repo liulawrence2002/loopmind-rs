@@ -158,6 +158,78 @@ pub struct SftLogConfig {
     pub samples: usize,
 }
 
+/// `configs/dpo.toml`: DPO on self-generated preference pairs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DpoConfig {
+    /// Starting weights, also the frozen reference. A checkpoint or a run directory.
+    pub init: PathBuf,
+    /// JSON lines written by `loopmind dpo-pairs`.
+    pub pairs: PathBuf,
+    pub run_dir: PathBuf,
+    pub tokenizer: PathBuf,
+    pub seed: u64,
+    pub epochs: u64,
+    pub max_steps: u64,
+    pub device: String,
+    #[serde(default = "default_precision")]
+    pub precision: String,
+    pub pad_multiple: usize,
+    /// DPO temperature on the log-probability ratios.
+    pub beta: f64,
+    /// Weight of the chosen answer's token-mean NLL added to the DPO loss.
+    pub nll_weight: f64,
+    /// Leading pairs held out for validation.
+    pub val_pairs: usize,
+    /// Fixed loop count for validation.
+    pub val_loops: usize,
+    pub optim: OptimConfig,
+    pub batch: DpoBatchConfig,
+    pub log: DpoLogConfig,
+    pub checkpoint: CheckpointConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DpoBatchConfig {
+    pub pairs_per_step: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DpoLogConfig {
+    pub every: u64,
+    pub val_every: u64,
+}
+
+impl DpoConfig {
+    pub fn from_path(path: &Path) -> Result<Self, TrainError> {
+        let config: Self = toml::from_str(&fs::read_to_string(path)?)?;
+        if config.epochs == 0 || config.batch.pairs_per_step == 0 || config.pad_multiple == 0 {
+            return Err(TrainError::new(
+                "epochs, pairs_per_step, and pad_multiple must be greater than 0",
+            ));
+        }
+        if !(config.beta.is_finite() && config.beta > 0.0) || config.nll_weight < 0.0 {
+            return Err(TrainError::new(
+                "beta must be positive and nll_weight at least 0",
+            ));
+        }
+        if !(config.optim.learning_rate > 0.0
+            && config.optim.min_learning_rate >= 0.0
+            && config.optim.min_learning_rate <= config.optim.learning_rate)
+        {
+            return Err(TrainError::new(
+                "learning rates must satisfy 0 <= min_learning_rate <= learning_rate",
+            ));
+        }
+        if config.val_loops == 0 || config.checkpoint.keep == 0 {
+            return Err(TrainError::new(
+                "val_loops and checkpoint.keep must be at least 1",
+            ));
+        }
+        Precision::parse(&config.precision).map_err(TrainError::new)?;
+        Ok(config)
+    }
+}
+
 impl SftConfig {
     pub fn from_path(path: &Path) -> Result<Self, TrainError> {
         let text = fs::read_to_string(path)?;
@@ -242,6 +314,17 @@ mod tests {
         assert!((config.optim.learning_rate - 3.0e-4).abs() < 1e-12);
         assert_eq!(config.checkpoint.keep, 2);
         assert_eq!(config.precision, "f32");
+    }
+
+    #[test]
+    fn checked_in_refine_and_dpo_configs_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let refine = SftConfig::from_path(&root.join("sft-refine.toml")).unwrap();
+        let sft = SftConfig::from_path(&root.join("sft.toml")).unwrap();
+        assert!(refine.optim.learning_rate < sft.optim.learning_rate);
+        assert_eq!(refine.epochs, 1);
+        let dpo = DpoConfig::from_path(&root.join("dpo.toml")).unwrap();
+        assert!(dpo.beta > 0.0 && dpo.val_pairs > 0);
     }
 
     #[test]

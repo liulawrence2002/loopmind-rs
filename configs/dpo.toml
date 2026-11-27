@@ -1,0 +1,39 @@
+# Self-generated DPO. `loopmind dpo-pairs` writes the pairs: chosen is the dataset's
+# reference answer to a training prompt, rejected is the model's own sampled answer.
+# `init` is the starting weights and also the frozen reference.
+
+init = "runs/sft"
+pairs = "runs/dpo/pairs.jsonl"
+run_dir = "runs/dpo"
+tokenizer = "tokenizer/tokenizer.json"
+seed = 44
+epochs = 2
+max_steps = 0
+device = "cpu"
+precision = "f32"
+pad_multiple = 64
+beta = 0.1
+nll_weight = 0.2
+val_pairs = 256
+val_loops = 4
+
+[optim]
+learning_rate = 1.0e-5
+min_learning_rate = 1.0e-6
+weight_decay = 0.0
+beta1 = 0.9
+beta2 = 0.95
+epsilon = 1.0e-8
+grad_clip = 1.0
+warmup_steps = 20
+
+[batch]
+pairs_per_step = 8
+
+[log]
+every = 1
+val_every = 100
+
+[checkpoint]
+every = 200
+keep = 2

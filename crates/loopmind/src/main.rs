@@ -111,32 +111,35 @@ enum Command {
         #[arg(long)]
         init: Option<PathBuf>,
     },
-    /// Chat with an SFT checkpoint (M5). Reads turns from stdin unless --prompt is given.
+    /// Chat with a finetuned checkpoint (M5). Reads turns from stdin unless --prompt is given.
+    ///
+    /// Without --checkpoint, uses `runs/best.json` (written by scripts/refine.sh) for the
+    /// checkpoint, loop count, and sampling, falling back to `runs/sft`. Flags override it.
     Chat {
         /// Checkpoint directory, or a run directory whose latest.json names one.
-        #[arg(long, default_value = "runs/sft")]
-        checkpoint: PathBuf,
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
         /// One user message. Prints the answer and exits.
         #[arg(long)]
         prompt: Option<String>,
         /// Optional system message at the start of the conversation.
         #[arg(long)]
         system: Option<String>,
-        /// Fixed loop count `r`.
-        #[arg(long, default_value_t = 4)]
-        loops: usize,
+        /// Fixed loop count `r` (default 4, or runs/best.json).
+        #[arg(long)]
+        loops: Option<usize>,
         /// New tokens per answer.
         #[arg(long, default_value_t = 256)]
         max_new: usize,
-        /// Softmax temperature. 0 is greedy.
-        #[arg(long, default_value_t = 0.7)]
-        temperature: f32,
-        /// Sample among this many most likely tokens. 0 keeps all.
-        #[arg(long, default_value_t = 40)]
-        top_k: usize,
-        /// Penalty on tokens already in the context. 1.0 turns it off.
-        #[arg(long, default_value_t = 1.1)]
-        repetition_penalty: f32,
+        /// Softmax temperature. 0 is greedy (default 0.7, or runs/best.json).
+        #[arg(long)]
+        temperature: Option<f32>,
+        /// Sample among this many most likely tokens. 0 keeps all (default 40, or runs/best.json).
+        #[arg(long)]
+        top_k: Option<usize>,
+        /// Penalty on tokens already in the context. 1.0 turns it off (default 1.1).
+        #[arg(long)]
+        repetition_penalty: Option<f32>,
         /// Sampling seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
@@ -146,6 +149,94 @@ enum Command {
         /// `cpu`, `cuda`, or `wgpu`.
         #[arg(long, default_value = "cpu")]
         device: String,
+    },
+    /// Held-out eval: masked loss over the loop dial, scored answers, chat smoke prompts.
+    Eval {
+        /// Checkpoint directory, or a run directory whose latest.json names one.
+        #[arg(long, default_value = "runs/sft")]
+        checkpoint: PathBuf,
+        /// Where to write the JSON report. A Markdown copy goes next to it.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "data/prepared/sft/eval.jsonl")]
+        eval_file: PathBuf,
+        #[arg(long, default_value = "tokenizer/tokenizer.json")]
+        tokenizer: PathBuf,
+        /// `cpu`, `cuda`, or `wgpu`.
+        #[arg(long, default_value = "cpu")]
+        device: String,
+        /// Loop counts for the masked loss over every eval row.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,4,8,16")]
+        nll_loops: Vec<usize>,
+        /// Loop counts for the greedy answer sweep.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,4,8,16")]
+        gen_loops: Vec<usize>,
+        /// Sampling presets tried at the best greedy loop count.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "greedy,t0.3-k20,t0.7-k40"
+        )]
+        sampling: Vec<String>,
+        /// Leading eval rows per config that get generated answers.
+        #[arg(long, default_value_t = 50)]
+        gen_rows: usize,
+        #[arg(long, default_value_t = 160)]
+        max_new: usize,
+        /// Rows per forward.
+        #[arg(long, default_value_t = 16)]
+        batch: usize,
+        #[arg(long, default_value_t = 64)]
+        pad_multiple: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// Write DPO preference pairs: reference answers (chosen) vs. the model's own (rejected).
+    DpoPairs {
+        /// The model whose sampled answers become the rejected side.
+        #[arg(long, default_value = "runs/sft")]
+        checkpoint: PathBuf,
+        #[arg(long, default_value = "runs/dpo/pairs.jsonl")]
+        out: PathBuf,
+        #[arg(long, default_value = "data/prepared/sft/train")]
+        train_dir: PathBuf,
+        #[arg(long, default_value = "tokenizer/tokenizer.json")]
+        tokenizer: PathBuf,
+        /// `cpu`, `cuda`, or `wgpu`.
+        #[arg(long, default_value = "cpu")]
+        device: String,
+        #[arg(long, default_value_t = 4096)]
+        count: usize,
+        #[arg(long, default_value_t = 512)]
+        max_prompt: usize,
+        /// Answer length cap; rows with longer reference answers are skipped.
+        #[arg(long, default_value_t = 160)]
+        max_new: usize,
+        #[arg(long, default_value_t = 4)]
+        loops: usize,
+        /// Sampling preset for the rejected answers.
+        #[arg(long, default_value = "t0.7-k40")]
+        sampling: String,
+        /// Prompts per generation batch.
+        #[arg(long, default_value_t = 32)]
+        batch: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+    },
+    /// DPO on the pairs from `dpo-pairs`.
+    Dpo {
+        #[arg(long, default_value = "configs/dpo.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        max_steps: Option<u64>,
+        /// `cpu`, `cuda`, or `wgpu`. Overrides the config.
+        #[arg(long)]
+        device: Option<String>,
+        /// Starting weights and reference. Overrides `init`.
+        #[arg(long)]
+        init: Option<PathBuf>,
     },
     /// Print the parameter breakdown for a config.
     Params {
@@ -367,7 +458,26 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             tokenizer,
             device,
         } => {
-            let checkpoint = find_dir(checkpoint)?;
+            let best = match &checkpoint {
+                Some(_) => None,
+                None => find_up(Path::new("runs/best.json"))
+                    .filter(|path| path.is_file())
+                    .map(|path| loopmind_train::BestModel::read(&path))
+                    .transpose()?,
+            };
+            let checkpoint = match (checkpoint, &best) {
+                (Some(path), _) => find_dir(path)?,
+                (None, Some(best)) => {
+                    eprintln!(
+                        "chat: runs/best.json -> {} ({})",
+                        best.checkpoint.display(),
+                        best.reason
+                    );
+                    find_dir(best.checkpoint.clone())?
+                }
+                (None, None) => find_dir(PathBuf::from("runs/sft"))?,
+            };
+            let sampling = best.as_ref().map(|best| best.sampling.clone());
             let tokenizer = LoopTokenizer::from_file(&find_file(tokenizer)?)?;
             let special = |name: &str| {
                 tokenizer
@@ -380,6 +490,22 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ];
             let engine = loopmind_train::load_inference(&checkpoint, &device)?;
             let context = engine.config().context_length;
+            let options = GenerateOptions {
+                loops: loops.or(best.as_ref().map(|best| best.loops)).unwrap_or(4),
+                max_new,
+                temperature: temperature
+                    .or(sampling.as_ref().map(|sampling| sampling.temperature))
+                    .unwrap_or(0.7),
+                top_k: top_k
+                    .or(sampling.as_ref().map(|sampling| sampling.top_k))
+                    .unwrap_or(40),
+                repetition_penalty: repetition_penalty
+                    .or(sampling
+                        .as_ref()
+                        .map(|sampling| sampling.repetition_penalty))
+                    .unwrap_or(1.1),
+                seed,
+            };
             let mut chat = Chat {
                 engine,
                 tokenizer: &tokenizer,
@@ -388,19 +514,124 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 history: system
                     .map(|text| vec![ChatTurn::new(Role::System, text)])
                     .unwrap_or_default(),
-                options: GenerateOptions {
-                    loops,
-                    max_new,
-                    temperature,
-                    top_k,
-                    repetition_penalty,
-                    seed,
-                },
+                options,
             };
             match prompt {
                 Some(prompt) => println!("{}", chat.respond(prompt)?),
                 None => chat.repl()?,
             }
+        }
+        Command::Eval {
+            checkpoint,
+            out,
+            eval_file,
+            tokenizer,
+            device,
+            nll_loops,
+            gen_loops,
+            sampling,
+            gen_rows,
+            max_new,
+            batch,
+            pad_multiple,
+            seed,
+        } => {
+            let sampling = sampling
+                .iter()
+                .map(|name| loopmind_train::sampling_named(name))
+                .collect::<Result<Vec<_>, _>>()?;
+            let report = loopmind_train::evaluate(&loopmind_train::EvalOptions {
+                checkpoint: find_dir(checkpoint)?,
+                eval_file: find_file(eval_file)?,
+                tokenizer: find_file(tokenizer)?,
+                device,
+                nll_loops,
+                gen_loops,
+                sampling,
+                gen_rows_per_config: gen_rows,
+                max_new,
+                batch,
+                pad_multiple,
+                seed,
+            })?;
+            loopmind_train::write_report(&report, &out)?;
+            println!(
+                "eval recommended r = {} {} (macro {:.1}%), best-loss r = {}; report {}",
+                report.recommended.loops,
+                report.recommended.sampling.name,
+                report.recommended.macro_accuracy * 100.0,
+                report.best_nll_loops,
+                out.display()
+            );
+        }
+        Command::DpoPairs {
+            checkpoint,
+            out,
+            train_dir,
+            tokenizer,
+            device,
+            count,
+            max_prompt,
+            max_new,
+            loops,
+            sampling,
+            batch,
+            seed,
+        } => {
+            let report = loopmind_train::make_pairs(&loopmind_train::PairOptions {
+                checkpoint: find_dir(checkpoint)?,
+                train_dir: find_dir(train_dir)?,
+                tokenizer: find_file(tokenizer)?,
+                device,
+                out: out.clone(),
+                count,
+                max_prompt,
+                max_new,
+                loops,
+                sampling: loopmind_train::sampling_named(&sampling)?,
+                batch,
+                seed,
+            })?;
+            println!(
+                "dpo pairs: {} written to {} from {} candidates; {} finished, {} identical skipped; mean prompt {:.0}, chosen {:.0}, rejected {:.0} tokens; {:.0}s",
+                report.pairs,
+                out.display(),
+                report.candidates,
+                report.finished,
+                report.identical_skipped,
+                report.mean_prompt,
+                report.mean_chosen,
+                report.mean_rejected,
+                report.seconds
+            );
+        }
+        Command::Dpo {
+            config,
+            resume,
+            max_steps,
+            device,
+            init,
+        } => {
+            let mut config = load_dpo_config(config)?;
+            if let Some(init) = init {
+                config.init = find_dir(init)?;
+            }
+            let summary = loopmind_train::dpo(
+                &config,
+                &loopmind_train::RunOverrides {
+                    resume,
+                    max_steps,
+                    device,
+                },
+            )?;
+            println!(
+                "finished {} dpo steps, {} tokens, loss {:.4}, {} {}",
+                summary.steps,
+                summary.tokens_seen,
+                summary.final_loss,
+                summary.device,
+                summary.precision
+            );
         }
         Command::Params { config } => {
             let path = find_file(config)?;
@@ -454,6 +685,25 @@ fn load_sft_config(path: PathBuf) -> Result<loopmind_train::SftConfig, Box<dyn s
     for slot in [
         &mut config.init,
         &mut config.data_dir,
+        &mut config.run_dir,
+        &mut config.tokenizer,
+    ] {
+        if slot.is_relative() {
+            *slot = root.join(&*slot);
+        }
+    }
+    Ok(config)
+}
+
+fn load_dpo_config(path: PathBuf) -> Result<loopmind_train::DpoConfig, Box<dyn std::error::Error>> {
+    let path = find_file(path)?;
+    let mut config = loopmind_train::DpoConfig::from_path(&path)?;
+    let root = path.parent().and_then(|dir| dir.parent()).ok_or_else(|| {
+        ConfigError::Invalid("dpo config is not inside a configs directory".into())
+    })?;
+    for slot in [
+        &mut config.init,
+        &mut config.pairs,
         &mut config.run_dir,
         &mut config.tokenizer,
     ] {

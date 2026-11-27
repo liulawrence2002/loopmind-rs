@@ -129,6 +129,25 @@ impl LoopMind {
         }
     }
 
+    /// Logits at the last position only, `[batch, vocab]`, at a fixed `r`.
+    ///
+    /// Generation needs nothing else, and the tied head over every position is the
+    /// largest matmul in a forward. The expert-slot statistics are not read back.
+    pub fn last_logits(&self, tokens: Tensor<2, Int>, loops: usize) -> Tensor<2> {
+        assert!(loops >= 1, "loop count must be at least 1");
+        let [batch, seq] = tokens.dims();
+        let embedded = self.embed.forward(tokens);
+        let ctx =
+            AttnContext::new(&self.config, batch, seq, &embedded.device()).cast(embedded.dtype());
+        let e = dense_stack(&self.prelude, embedded, &ctx);
+        let (state, _, _) = self.recur(e, loops, usize::MAX, None, &ctx);
+        let hidden = self
+            .final_norm
+            .forward(dense_stack(&self.coda, state, &ctx))
+            .narrow(1, seq - 1, 1);
+        tied_logits(hidden, &self.embed).reshape([batch, self.config.vocab_size])
+    }
+
     fn forward_opts(
         &self,
         tokens: Tensor<2, Int>,
@@ -431,57 +450,107 @@ pub struct GenerateOptions {
 /// Returns only the new ids, without the stop id.
 pub fn sample_continue(
     model: &LoopMind,
-    mut ids: Vec<u32>,
+    ids: Vec<u32>,
     options: &GenerateOptions,
     stop: &[u32],
     device: &burn::tensor::Device,
 ) -> Vec<u32> {
+    sample_batch(model, &[ids], options, stop, device)
+        .pop()
+        .unwrap_or_default()
+}
+
+/// Sampled continuations of prompts that all have the same length, in one batch.
+///
+/// There is no KV cache, so each step reruns the window. Equal lengths need no
+/// padding mask: every unfinished row grows by one id per step, so the rows stay
+/// aligned. A row leaves the batch when it emits an id in `stop`. Row `i` samples
+/// with seed `options.seed + i`. Returns each row's new ids, without the stop id.
+pub fn sample_batch(
+    model: &LoopMind,
+    prompts: &[Vec<u32>],
+    options: &GenerateOptions,
+    stop: &[u32],
+    device: &burn::tensor::Device,
+) -> Vec<Vec<u32>> {
+    let Some(first) = prompts.first() else {
+        return Vec::new();
+    };
+    assert!(
+        prompts.iter().all(|prompt| prompt.len() == first.len()),
+        "sample_batch needs prompts of one length"
+    );
     let context = model.config.context_length.max(1);
-    let mut rng = TrainRng::new(options.seed);
-    let mut produced = Vec::new();
+    let vocab = model.config.vocab_size;
+    let mut rows: Vec<Vec<u32>> = prompts.to_vec();
+    let mut produced = vec![Vec::new(); prompts.len()];
+    let mut rngs: Vec<TrainRng> = (0..prompts.len())
+        .map(|index| TrainRng::new(options.seed.wrapping_add(index as u64)))
+        .collect();
+    let mut active: Vec<usize> = (0..prompts.len()).collect();
+    if first.is_empty() {
+        return produced;
+    }
     for _ in 0..options.max_new {
-        if ids.is_empty() {
+        if active.is_empty() {
             break;
         }
-        let window = if ids.len() > context {
-            &ids[ids.len() - context..]
-        } else {
-            ids.as_slice()
-        };
-        let flat: Vec<i32> = window.iter().map(|id| *id as i32).collect();
-        let tokens = Tensor::<2, Int>::from_data(TensorData::new(flat, [1, window.len()]), device);
-        let mut logits: Vec<f32> = model
-            .forward(tokens, options.loops)
-            .logits
-            .narrow(1, window.len() - 1, 1)
-            .reshape([model.config.vocab_size])
+        let len = rows[active[0]].len();
+        let window = len.min(context);
+        let start = len - window;
+        let flat: Vec<i32> = active
+            .iter()
+            .flat_map(|row| rows[*row][start..].iter().map(|id| *id as i32))
+            .collect();
+        let tokens =
+            Tensor::<2, Int>::from_data(TensorData::new(flat, [active.len(), window]), device);
+        let logits: Vec<f32> = model
+            .last_logits(tokens, options.loops)
             .cast(burn::tensor::DType::F32)
             .into_data()
             .try_into_vec()
             .expect("logits are f32");
-        if options.repetition_penalty != 1.0 {
-            let mut seen = vec![false; logits.len()];
-            for id in window {
-                seen[*id as usize] = true;
+        let mut still = Vec::with_capacity(active.len());
+        for (slot, row) in active.iter().enumerate() {
+            let mut row_logits = logits[slot * vocab..(slot + 1) * vocab].to_vec();
+            penalize_repeats(
+                &mut row_logits,
+                &rows[*row][start..],
+                options.repetition_penalty,
+            );
+            let next = pick_token(&row_logits, options, &mut rngs[*row]);
+            if stop.contains(&next) {
+                continue;
             }
-            for (logit, was_seen) in logits.iter_mut().zip(seen) {
-                if was_seen {
-                    *logit = if *logit > 0.0 {
-                        *logit / options.repetition_penalty
-                    } else {
-                        *logit * options.repetition_penalty
-                    };
-                }
-            }
+            rows[*row].push(next);
+            produced[*row].push(next);
+            still.push(*row);
         }
-        let next = pick_token(&logits, options, &mut rng);
-        if stop.contains(&next) {
-            break;
-        }
-        ids.push(next);
-        produced.push(next);
+        active = still;
     }
     produced
+}
+
+/// Divide positive logits (multiply negative ones) of ids already in `window`.
+fn penalize_repeats(logits: &mut [f32], window: &[u32], penalty: f32) {
+    if penalty == 1.0 {
+        return;
+    }
+    let mut seen = vec![false; logits.len()];
+    for id in window {
+        if let Some(slot) = seen.get_mut(*id as usize) {
+            *slot = true;
+        }
+    }
+    for (logit, was_seen) in logits.iter_mut().zip(seen) {
+        if was_seen {
+            *logit = if *logit > 0.0 {
+                *logit / penalty
+            } else {
+                *logit * penalty
+            };
+        }
+    }
 }
 
 fn pick_token(logits: &[f32], options: &GenerateOptions, rng: &mut TrainRng) -> u32 {

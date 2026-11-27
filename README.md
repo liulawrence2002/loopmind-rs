@@ -72,7 +72,7 @@ Pretrain, 50M tokens ([`loopmind-data`](crates/loopmind-data)):
 
 Sequences are 1024 tokens, so this budget packs to 49,997,824 train tokens. The measured build (44.6s pretrain, 82.3s SFT, 153,517 train rows, 2,000 eval rows) is in [docs/data.md](docs/data.md).
 
-SFT uses English chat rows of `KeremTT/FABLE-5.2-MAX-DATABASE`. Rows over 1024 tokens are dropped, Turkish rows are dropped, and 2,000 checkable rows are held out for eval. CC-BY-SA rows stay unless `sft.exclude_cc_by_sa` is set. The builder, shard layout, and the ThinkPad command are in [docs/data.md](docs/data.md). DPO is later and out of scope.
+SFT uses English chat rows of `KeremTT/FABLE-5.2-MAX-DATABASE`. Rows over 1024 tokens are dropped, Turkish rows are dropped, and 2,000 checkable rows are held out for eval. CC-BY-SA rows stay unless `sft.exclude_cc_by_sa` is set. The builder, shard layout, and the ThinkPad command are in [docs/data.md](docs/data.md). DPO pairs are generated from the same train split; see [docs/refine.md](docs/refine.md).
 
 ## Crates
 
@@ -110,6 +110,8 @@ cargo run -p loopmind --release --features cuda -- pretrain --config configs/pre
 cargo run -p loopmind --release -- sample --checkpoint runs/pretrain --prompt "Once upon a time" --loops 4
 cargo run -p loopmind --release --features cuda -- sft --config configs/sft.toml --device cuda
 cargo run -p loopmind --release --features cuda -- chat --checkpoint runs/sft --device cuda
+DEVICE=cuda scripts/refine.sh   # eval, loop-dial tuning, refine pass, self-generated DPO
+cargo run -p loopmind --release --features cuda -- chat --device cuda   # uses runs/best.json
 ```
 
 Train and use the tokenizer:
@@ -148,8 +150,8 @@ cargo run -p moe-bakeoff --release --features cuda   # RTX 4070 Laptop, needs th
 | M3 | Data pipeline for the pretrain mix and the English SFT split. Done. See [docs/data.md](docs/data.md). |
 | M4 | Pretrain loop: AdamW, sampled loop counts, truncated backprop, checkpoints. Done. See [docs/pretrain.md](docs/pretrain.md). |
 | M5 | SFT and the chat CLI. Done. See [docs/sft.md](docs/sft.md). |
+| M6 | Held-out eval, loop-dial tuning, a low-LR refinement pass, and self-generated DPO. See [docs/refine.md](docs/refine.md). |
 
-DPO comes after these milestones.
 
 ## Hardware
 
