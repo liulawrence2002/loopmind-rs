@@ -1,8 +1,7 @@
 //! Burn is the tensor framework for training and inference.
 //!
 //! CI builds the pure-Rust `flex` backend. Local GPU builds add `wgpu` or
-//! `cuda` (the RTX 4070 Laptop uses `cuda`). No Burn type is part of this
-//! crate's public API.
+//! `cuda` (the RTX 4070 Laptop uses `cuda`).
 
 /// Framework linked into this crate.
 pub fn framework_name() -> &'static str {

@@ -4114,12 +4114,20 @@ dependencies = [
 [[package]]
 name = "loopmind-data"
 version = "0.1.0"
+dependencies = [
+ "loopmind-tokenizer",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml 0.8.23",
+]
 
 [[package]]
 name = "loopmind-model"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "loopmind-data",
  "serde",
  "toml 0.8.23",
 ]

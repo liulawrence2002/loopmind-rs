@@ -1,0 +1,24 @@
+# Reproducible pretrain and SFT builds. Raw downloads stay under data/ and are not committed.
+# Raise pretrain.total_tokens (for example to 200000000) to scale the same 50/20/20/10 mix.
+
+seed = 42
+tokenizer = "tokenizer/tokenizer.json"
+output_dir = "data/prepared"
+python = "python3"
+
+[revisions]
+fineweb = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+cosmopedia = "3ba9d605774198c5868892d7a8deda78031a781f"
+tinystories = "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64"
+fable = "d0bcd6b2181f5588afa9e136a383397dff956620"
+
+[pretrain]
+total_tokens = 50_000_000
+context_length = 1024
+val_ratio = 0.01
+shard_sequences = 512
+
+[sft]
+max_tokens = 1024
+eval_rows = 2000
+exclude_cc_by_sa = false
