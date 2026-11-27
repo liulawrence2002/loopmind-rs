@@ -77,7 +77,7 @@ SFT uses English chat rows of `KeremTT/FABLE-5.2-MAX-DATABASE`. Rows over 1024 t
 | Crate | Role |
 | --- | --- |
 | `loopmind-model` | Config, parameter census, and Burn. The only crate allowed to depend on a tensor framework. |
-| `loopmind-tokenizer` | BPE target (M2). |
+| `loopmind-tokenizer` | Byte-level BPE, chat template, and assistant loss mask. |
 | `loopmind-data` | Pretrain mix and SFT rules (M3). |
 | `loopmind-train` | Pretrain and SFT drivers (M4, M5). Depends on the model crate, not on Burn. |
 | `loopmind` | `clap` CLI. |
@@ -99,7 +99,17 @@ cargo run -p loopmind -- params --config configs/default.toml
 cargo test --workspace
 ```
 
-`tokenize-train`, `pretrain`, `sft`, and `chat` are stubs. Each prints the milestone that will implement it and exits 0. `pretrain` and `sft` also print the data plan.
+`pretrain`, `sft`, and `chat` are stubs. Each prints the milestone that will implement it and exits 0. `pretrain` and `sft` also print the data plan.
+
+Train and use the tokenizer:
+
+```bash
+python python/fetch_tokenizer_corpus.py
+cargo run -p loopmind -- tokenize-train --config configs/tokenizer.toml
+cargo run -p loopmind -- tokenize --text "Hello, world."
+```
+
+The trained file is `tokenizer/tokenizer.json` (vocab 6400). Raw corpus stays in `data/` and is gitignored. Bytes per token are in [docs/tokenizer.md](docs/tokenizer.md).
 
 PyTorch parity, after the Rust test has written `target/parity`:
 
@@ -123,7 +133,7 @@ cargo run -p moe-bakeoff --release --features cuda   # RTX 4070 Laptop, needs th
 | --- | --- |
 | M0 | Workspace, config, parameter census, CI. Done. |
 | M1 | Forward pass, gradient-coverage test, PyTorch parity on a tiny config, and a Burn vs Candle check. Done. See [docs/framework-decision.md](docs/framework-decision.md). |
-| M2 | Train the 6400-vocab BPE. |
+| M2 | 6400-vocab byte-level BPE, chat template, and loss mask. Done. See [docs/tokenizer.md](docs/tokenizer.md). |
 | M3 | Data pipeline for the pretrain mix and the English SFT split. |
 | M4 | Pretrain loop: random `r` per sequence, truncated backprop through the last 4 passes. |
 | M5 | SFT and the chat CLI. |

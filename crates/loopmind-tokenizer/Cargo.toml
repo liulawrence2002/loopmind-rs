@@ -6,4 +6,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "LoopMind BPE tokenizer target. Training lands in M2."
+description = "LoopMind byte-level BPE tokenizer and chat template."
+
+[dependencies]
+serde = { workspace = true }
+tokenizers = "=0.23.2"
+toml = { workspace = true }

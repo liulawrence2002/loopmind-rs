@@ -1,0 +1,6 @@
+# Train the English byte-level BPE. Raw text is downloaded by
+# `python python/fetch_tokenizer_corpus.py` into `data/` and is not committed.
+
+vocab_size = 6400
+corpus_dir = "data/tokenizer/train"
+output = "tokenizer/tokenizer.json"

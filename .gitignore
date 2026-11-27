@@ -8,3 +8,6 @@
 
 .env
 .env.*
+
+# Tokenizer training corpus. The trained tokenizer.json is committed.
+/data/
