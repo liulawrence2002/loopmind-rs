@@ -85,7 +85,7 @@ fn time_burn(config: &LoopMindConfig) -> f64 {
     let mut samples = Vec::with_capacity(WARMUP + ITERS);
     for _ in 0..(WARMUP + ITERS) {
         let start = Instant::now();
-        let (output, aux) = moe.forward(input.clone(), None);
+        let (output, aux, _slots) = moe.forward(input.clone(), None);
         let loss = output.sum() + aux;
         let _grads = loss.backward();
         samples.push(start.elapsed().as_secs_f64() * 1_000.0);

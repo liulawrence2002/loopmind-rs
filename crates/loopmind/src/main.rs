@@ -57,8 +57,42 @@ enum Command {
         #[arg(long, default_value = "configs/data.toml")]
         config: PathBuf,
     },
-    /// Pretrain on the 50M-token mix (M4).
-    Pretrain,
+    /// Pretrain on the packed mix (M4).
+    Pretrain {
+        /// Training config. Paths inside it are relative to the repo root.
+        #[arg(long, default_value = "configs/pretrain.toml")]
+        config: PathBuf,
+        /// Continue from the latest checkpoint in the run directory.
+        #[arg(long)]
+        resume: bool,
+        /// Stop after this many optimizer steps. Overrides the config.
+        #[arg(long)]
+        max_steps: Option<u64>,
+        /// `cpu`, `cuda`, or `wgpu`. Overrides the config.
+        #[arg(long)]
+        device: Option<String>,
+    },
+    /// Greedy sample from a pretrain checkpoint.
+    Sample {
+        /// Checkpoint directory (`runs/pretrain/checkpoints/step-00000200`).
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// Text to continue.
+        #[arg(long)]
+        prompt: String,
+        /// Fixed loop count `r`.
+        #[arg(long, default_value_t = 4)]
+        loops: usize,
+        /// New tokens to generate.
+        #[arg(long, default_value_t = 64)]
+        max_new: usize,
+        /// Path to tokenizer.json.
+        #[arg(long, default_value = "tokenizer/tokenizer.json")]
+        tokenizer: PathBuf,
+        /// `cpu`, `cuda`, or `wgpu`.
+        #[arg(long, default_value = "cpu")]
+        device: String,
+    },
     /// Supervised-finetune on English chat (M5).
     Sft,
     /// Chat with a finetuned checkpoint (M5).
@@ -199,12 +233,48 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 config.output_dir.join("sft/manifest.json").display()
             );
         }
-        Command::Pretrain => {
-            println!("{}", loopmind_train::pretrain_status());
-            println!("pretrain mix: {} tokens", loopmind_data::pretrain_tokens());
-            for slice in loopmind_data::PRETRAIN_SLICES {
-                println!("  {}  {}  {}", slice.tokens, slice.name, slice.dataset);
-            }
+        Command::Pretrain {
+            config,
+            resume,
+            max_steps,
+            device,
+        } => {
+            let config = load_pretrain_config(config)?;
+            let summary = loopmind_train::pretrain(
+                &config,
+                &loopmind_train::RunOverrides {
+                    resume,
+                    max_steps,
+                    device,
+                },
+            )?;
+            println!(
+                "finished {} steps, {} tokens, loss {:.4}, {} {}",
+                summary.steps,
+                summary.tokens_seen,
+                summary.final_loss,
+                summary.device,
+                summary.precision
+            );
+        }
+        Command::Sample {
+            checkpoint,
+            prompt,
+            loops,
+            max_new,
+            tokenizer,
+            device,
+        } => {
+            let checkpoint = find_dir(checkpoint)?;
+            let tokenizer_path = find_file(tokenizer)?;
+            let tokenizer = LoopTokenizer::from_file(&tokenizer_path)?;
+            let eos = tokenizer
+                .token_id(loopmind_tokenizer::EOS)
+                .ok_or_else(|| ConfigError::Invalid("tokenizer is missing <|eos|>".into()))?;
+            let ids = tokenizer.encode(&prompt)?;
+            let generated =
+                loopmind_train::generate(&checkpoint, &ids, loops, max_new, eos, &device)?;
+            println!("{}", tokenizer.decode(&generated)?);
         }
         Command::Sft => {
             let policy = loopmind_data::SFT_POLICY;
@@ -229,6 +299,22 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn load_pretrain_config(
+    path: PathBuf,
+) -> Result<loopmind_train::PretrainConfig, Box<dyn std::error::Error>> {
+    let path = find_file(path)?;
+    let mut config = loopmind_train::PretrainConfig::from_path(&path)?;
+    let root = path.parent().and_then(|dir| dir.parent()).ok_or_else(|| {
+        ConfigError::Invalid("pretrain config is not inside a configs directory".into())
+    })?;
+    for slot in [&mut config.model, &mut config.data_dir, &mut config.run_dir] {
+        if slot.is_relative() {
+            *slot = root.join(&*slot);
+        }
+    }
+    Ok(config)
 }
 
 fn load_data_config(

@@ -1,9 +1,17 @@
-//! Pretrain and SFT drivers.
+//! Pretrain loop. SFT stays a stub until M5.
 //!
-//! M4 owns the pretrain loop (random loop count per sequence, truncated
-//! backprop). M5 owns SFT. This crate will depend on `loopmind-model` and
-//! `loopmind-data`. It does not depend on Burn; the tensor framework stays
-//! inside `loopmind-model`.
+//! Burn stays in `loopmind-model`. This crate owns the epoch cursor, the
+//! learning-rate schedule, the logs, and the checkpoints.
+
+mod config;
+mod error;
+mod run;
+mod schedule;
+
+pub use config::PretrainConfig;
+pub use error::TrainError;
+pub use run::{generate, pretrain, RunOverrides, RunSummary};
+pub use schedule::learning_rate;
 
 /// Milestone that owns the pretrain loop.
 pub const PRETRAIN_MILESTONE: &str = "M4";
@@ -11,9 +19,9 @@ pub const PRETRAIN_MILESTONE: &str = "M4";
 /// Milestone that owns supervised finetuning.
 pub const SFT_MILESTONE: &str = "M5";
 
-/// What `loopmind pretrain` reports until M4.
+/// What `loopmind pretrain` is.
 pub fn pretrain_status() -> &'static str {
-    "pretrain is not implemented yet (planned for M4)"
+    "M4 pretrain loop"
 }
 
 /// What `loopmind sft` reports until M5.

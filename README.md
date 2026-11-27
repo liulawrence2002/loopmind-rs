@@ -101,11 +101,13 @@ cargo run -p loopmind -- params --config configs/default.toml
 cargo test --workspace
 ```
 
-`pretrain`, `sft`, and `chat` are stubs. Each prints the milestone that will implement it and exits 0. `pretrain` and `sft` also print the data plan. Preparing the shards is separate:
+`sft` and `chat` are stubs. Each prints the milestone that will implement it and exits 0. `sft` also prints the data plan. Preparing the shards, then pretraining:
 
 ```bash
 cargo run -p loopmind --release -- prepare-pretrain --config configs/data.toml
 cargo run -p loopmind --release -- prepare-sft --config configs/data.toml
+cargo run -p loopmind --release --features cuda -- pretrain --config configs/pretrain.toml --device cuda
+cargo run -p loopmind --release -- sample --checkpoint runs/pretrain/checkpoints/step-00000200 --prompt "Once upon a time" --loops 4
 ```
 
 Train and use the tokenizer:
@@ -142,7 +144,7 @@ cargo run -p moe-bakeoff --release --features cuda   # RTX 4070 Laptop, needs th
 | M1 | Forward pass, gradient-coverage test, PyTorch parity on a tiny config, and a Burn vs Candle check. Done. See [docs/framework-decision.md](docs/framework-decision.md). |
 | M2 | 6400-vocab byte-level BPE, chat template, and loss mask. Done. See [docs/tokenizer.md](docs/tokenizer.md). |
 | M3 | Data pipeline for the pretrain mix and the English SFT split. Done. See [docs/data.md](docs/data.md). |
-| M4 | Pretrain loop: random `r` per sequence, truncated backprop through the last 4 passes. |
+| M4 | Pretrain loop: AdamW, sampled loop counts, truncated backprop, checkpoints. Done. See [docs/pretrain.md](docs/pretrain.md). |
 | M5 | SFT and the chat CLI. |
 
 DPO comes after these milestones.

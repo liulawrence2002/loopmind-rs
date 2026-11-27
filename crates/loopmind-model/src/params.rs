@@ -110,6 +110,28 @@ impl LoopMindConfig {
         })
     }
 
+    /// Forward-plus-backward FLOPs for one token when the core runs `mean_loops` times.
+    ///
+    /// Counts 6 FLOPs per active parameter (2 forward, 4 backward). The prelude and
+    /// coda run once. The core's active parameters run `mean_loops` times. Embeddings
+    /// are a lookup and are not included.
+    pub fn train_flops_per_token(&self, mean_loops: f64) -> Result<f64, ConfigError> {
+        let params = self.param_breakdown()?;
+        let width = self.d_model as u64;
+        let n_core = self.n_core_layers as u64;
+        let n_dense = (self.n_prelude_layers + self.n_coda_layers) as u64;
+        let n_layers = n_dense + n_core;
+        let attn_one = params.attention.checked_div(n_layers).unwrap_or(0);
+        let dense_one = params.dense_ffn.checked_div(n_dense).unwrap_or(0);
+        let norms_per_layer = 2 * width;
+        let final_norm = if n_layers == 0 { 0 } else { width };
+        let core_once =
+            attn_one * n_core + norms_per_layer * n_core + params.routers + params.active_experts;
+        let non_core =
+            attn_one * n_dense + dense_one * n_dense + norms_per_layer * n_dense + final_norm;
+        Ok(6.0 * (non_core as f64 + mean_loops * core_once as f64))
+    }
+
     /// Multi-line census for the `params` command.
     pub fn report(&self) -> Result<String, ConfigError> {
         let params = self.param_breakdown()?;
