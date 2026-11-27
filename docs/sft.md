@@ -13,16 +13,24 @@ cargo run -p loopmind --release --features cuda -- chat --checkpoint runs/sft --
 ## What a step does
 
 - Take the next `rows_per_step` (16) conversations from a seeded shuffle of the 153,517 train rows. One epoch visits every row once. The cursor is in the checkpoint.
-- Pad each row with `<|pad|>` to a multiple of `pad_multiple` (16), about 2% extra tokens. Rows are not packed into a shared width: each row runs alone with its own sampled loop count, as a pretrain sequence does, so a shared width would only add padding.
+- Pad each row with `<|pad|>` to a multiple of `pad_multiple` (64). Rows are not packed into a shared width: each row runs alone with its own sampled loop count, as a pretrain sequence does, so a shared width would only add padding.
 - The loss is next-token cross-entropy on supervised targets only. The M2 mask is 1 on assistant content, the `<|im_end|>` that closes it, and the final `<|eos|>`. Token `t` is a target when `mask[t]` is 1, and it is predicted from position `t - 1`.
 - A step is the token-mean over every supervised target in its 16 rows: each row's masked NLL sum is divided by the step's target count before backward, and the gradients are summed, not averaged. The load-balancing term is averaged over rows. A long answer weighs more than a short one.
 - Loop counts, truncated backprop, AdamW, the parameter groups, and clipping are the pretrain ones. The optimizer starts fresh; only the weights come from `init`.
 
-The train split has 51.0M tokens (mean 332 per row, median 269) and 22.75M supervised targets. Padding to 16 makes 52.2M.
+The train split has 51.0M tokens (mean 332 per row, median 269) and 22.75M supervised targets.
+
+| `pad_multiple` | Padded tokens | Distinct widths | 4070 probe |
+| ---: | ---: | ---: | ---: |
+| 16 | 52.2M (+2.3%) | 63 | 0.86 s/step |
+| 64 | 56.0M (+9.6%) | 16 | 0.62 s/step |
+| 128 | 60.7M (+19.0%) | 8 | |
+
+Each new width costs CubeCL kernel compiles and an autotune pass, so 64 was faster than 16 despite the extra padding. The probes were 30–40 steps from the final pretrain checkpoint.
 
 | Knob | Value | Why |
 | --- | ---: | --- |
-| `rows_per_step` | 16 | about 5,400 padded tokens and 2,400 targets per step |
+| `rows_per_step` | 16 | about 5,800 padded tokens and 2,400 targets per step |
 | `epochs` | 2 | 19,190 steps |
 | `learning_rate` | 1e-4 | a third of the pretrain peak; cosine floor 1e-5, warmup 100 |
 | `weight_decay` | 0.1 | as pretrain |

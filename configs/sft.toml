@@ -1,6 +1,6 @@
 # M5: supervised finetune of the M4 pretrain checkpoint on the English FABLE chat split.
 # `init` is a checkpoint directory, or a run directory whose latest.json names one.
-# Rows run one at a time (each draws its own loop count), padded to a multiple of 16.
+# Rows run one at a time (each draws its own loop count), padded to a multiple of 64.
 # A step is the token-mean loss over every supervised target in its 16 rows.
 
 init = "runs/pretrain"
@@ -13,7 +13,7 @@ max_steps = 0
 device = "cpu"
 precision = "f32"
 peak_tflops = 15.0
-pad_multiple = 16
+pad_multiple = 64
 val_loops = [1, 2, 4, 8]
 
 [optim]
