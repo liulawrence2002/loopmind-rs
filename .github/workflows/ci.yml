@@ -57,7 +57,7 @@ jobs:
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Export Burn logits
-        run: cargo test -p loopmind-model export_parity_fixture -- --exact export_parity_fixture
+        run: cargo test -p loopmind-model -- --exact model_tests::export_parity_fixture_writes_logits
 
       - name: Compare with the PyTorch reference
         run: python python/reference.py target/parity

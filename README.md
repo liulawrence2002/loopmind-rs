@@ -104,7 +104,7 @@ cargo test --workspace
 PyTorch parity, after the Rust test has written `target/parity`:
 
 ```bash
-cargo test -p loopmind-model export_parity_fixture -- --exact export_parity_fixture
+cargo test -p loopmind-model -- --exact model_tests::export_parity_fixture_writes_logits
 python python/reference.py target/parity
 ```
 
