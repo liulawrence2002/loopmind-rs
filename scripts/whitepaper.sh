@@ -255,7 +255,7 @@ report
 # 5. Learning curves: every 6th checkpoint (49M tokens apart), 1,000 items per task.
 for step in 1500 3000 4500 6000 7500 9000 10500 12000 13500 15000; do
   dir=$(printf 'checkpoints/step-%08d' "$step")
-  bench "curve-loop-$step" "runs/pretrain-500m/$dir" 1,4 "${LIMITED[@]}"
+  bench "curve-loop-$step" "runs/pretrain-500m/$dir" 1,4,8 "${LIMITED[@]}"
   bench "curve-noloop-$step" "runs/wp-500m-noloop/$dir" 1 "${LIMITED[@]}"
 done
 report
