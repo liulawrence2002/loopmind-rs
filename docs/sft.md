@@ -37,6 +37,7 @@ Each new width costs CubeCL kernel compiles and an autotune pass, so 64 was fast
 | `val_every` | 500 | masked loss on `val_rows` (128) `eval.jsonl` rows at r = 1, 2, 4, 8, taken round-robin across the four configs, 32 each |
 | `checkpoint.every` | 500 | keep 3 |
 | `samples` | 4 | greedy answers at r = 4 to eval prompts taken the same way, one per config, printed at the end and written to `runs/sft/samples.txt` |
+| `total_steps` | 0 | when set, train exactly this many steps with the cosine schedule spanning them, a seeded random sample of the train split; 0 trains whole `epochs` |
 
 Validation uses held-out rows: `eval.jsonl` is 2,000 checkable rows that are not in the train shards. The validation loss is the same token-mean masked NLL. It is not an accuracy.
 

@@ -115,7 +115,21 @@ cargo run -p loopmind --release --features cuda -- chat --device cuda   # uses r
 cargo run -p loopmind --release --features cuda -- serve --device cuda  # chat page at http://127.0.0.1:8080
 ```
 
-The 500M-token pretrain (see [docs/pretrain.md](docs/pretrain.md#the-500m-run)):
+Zero-shot benchmarks (ARC, PIQA, HellaSwag, SciQ, OpenBookQA, LAMBADA, BLiMP) scored by log-likelihood at each loop count:
+
+```bash
+python python/fetch_benchmarks.py --out data/bench
+cargo run -p loopmind --release --features cuda -- bench --checkpoint runs/pretrain --out runs/bench/pretrain.json --device cuda
+```
+
+The whitepaper experiments, from the 50M-token comparisons to the 500M runs and SFT, run as one resumable pipeline ([docs/whitepaper.md](docs/whitepaper.md)):
+
+```bash
+setsid nohup scripts/whitepaper.sh > /dev/null 2>&1 &
+cat runs/whitepaper/STATUS
+```
+
+The 500M-token pretrain on its own (see [docs/pretrain.md](docs/pretrain.md#the-500m-run)):
 
 ```bash
 cargo run -p loopmind --release -- prepare-pretrain --config configs/data-500m.toml

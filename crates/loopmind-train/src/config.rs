@@ -128,6 +128,12 @@ pub struct SftConfig {
     pub seed: u64,
     pub epochs: u64,
     pub max_steps: u64,
+    /// Train this many steps, with the learning-rate schedule spanning them, instead of
+    /// `epochs` whole epochs. 0 keeps whole epochs. Rows come from the same seeded
+    /// shuffle, so a short run sees a random sample of the train split. `epochs` still
+    /// caps the run, so it must cover `total_steps`.
+    #[serde(default)]
+    pub total_steps: u64,
     pub device: String,
     #[serde(default = "default_precision")]
     pub precision: String,

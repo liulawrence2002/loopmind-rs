@@ -56,10 +56,53 @@ pub fn masked_shifted_logprob_rows(
     (picked * weights).sum_dim(1).reshape([batch])
 }
 
+/// Per-row count of supervised targets that the argmax does not predict, `[batch]`.
+///
+/// A row with 0 misses is one that greedy decoding reproduces token for token, which is
+/// how LAMBADA scores a continuation.
+pub fn masked_shifted_greedy_misses_rows(
+    logits: Tensor<3>,
+    tokens: Tensor<2, Int>,
+    mask: Tensor<2, Int>,
+) -> Tensor<1, Int> {
+    let [batch, seq, _] = logits.dims();
+    assert!(seq >= 2, "shifted loss needs at least two tokens");
+    let best = logits
+        .narrow(1, 0, seq - 1)
+        .argmax(2)
+        .reshape([batch, seq - 1]);
+    let targets = tokens.narrow(1, 1, seq - 1);
+    let weights = mask.narrow(1, 1, seq - 1);
+    (best.not_equal(targets).int() * weights)
+        .sum_dim(1)
+        .reshape([batch])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use burn::tensor::{Device, TensorData};
+
+    #[test]
+    fn greedy_misses_count_only_supervised_targets_the_argmax_gets_wrong() {
+        let device = Device::flex();
+        // Every position predicts token 2: logit 1 on id 2, 0 elsewhere.
+        let mut logits = vec![0f32; 2 * 3 * 4];
+        for position in 0..6 {
+            logits[position * 4 + 2] = 1.0;
+        }
+        let logits = Tensor::<3>::from_data(TensorData::new(logits, [2, 3, 4]), &device);
+        let tokens =
+            Tensor::<2, Int>::from_data(TensorData::new(vec![0, 2, 2, 0, 2, 3], [2, 3]), &device);
+        let mask =
+            Tensor::<2, Int>::from_data(TensorData::new(vec![0, 1, 1, 0, 1, 1], [2, 3]), &device);
+        let misses = masked_shifted_greedy_misses_rows(logits, tokens, mask)
+            .into_data()
+            .convert::<i64>()
+            .try_into_vec::<i64>()
+            .unwrap();
+        assert_eq!(misses, [0, 1]);
+    }
 
     #[test]
     fn masked_nll_counts_only_supervised_targets() {

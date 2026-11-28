@@ -1,0 +1,26 @@
+# Whitepaper baseline: LoopMind's exact layers and parameters, with the core run once.
+# Same 9.9M parameters and 2.38M active as configs/default.toml, without recurrence.
+
+d_model = 256
+n_q_heads = 4
+n_kv_heads = 2
+rope_theta = 1000000.0
+rms_norm_eps = 1e-6
+vocab_size = 6400
+tie_embeddings = true
+context_length = 1024
+
+n_prelude_layers = 1
+n_core_layers = 2
+n_coda_layers = 1
+dense_intermediate_size = 768
+
+n_experts = 32
+expert_intermediate_size = 128
+experts_per_token = 2
+reroute_every_pass = true
+
+loop_count_mean = 1.0
+loop_count_max = 1
+bptt_passes = 1
+aux_loss_coef = 1e-2

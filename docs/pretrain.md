@@ -154,6 +154,9 @@ With fused experts, the 50M run trained at about 12,000 tokens/s, 13,300 at its 
 
 ### Before launching
 
+`scripts/whitepaper.sh` ([whitepaper.md](whitepaper.md)) runs this as its `wp-500m-loop` stage. It writes `runs/whitepaper/configs/pretrain-500m-loop.toml` from this config, with the learning rate and loop depth its 50M runs chose, and it waits out CUDA failures. Item 2 below is then done by its 50M learning-rate pair, and item 3 by its loop-mean-8 run. For a run outside that pipeline:
+
+
 1. **CUDA check (2 minutes).** After a suspend, CUDA fails until the driver is reloaded (`sudo rmmod nvidia_uvm && sudo modprobe nvidia_uvm`) or the machine reboots. The script stops on that error rather than retrying. Twenty steps with validation at step 10 and 20 confirm the speed and the memory, including r = 16. A config must sit inside the repo, because its paths resolve from the repo root.
 
    ```bash

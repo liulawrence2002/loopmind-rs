@@ -220,6 +220,34 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+    /// Zero-shot benchmarks (data/bench, from python/fetch_benchmarks.py) scored by
+    /// log-likelihood at each loop count.
+    Bench {
+        /// Checkpoint directory, or a run directory whose latest.json names one.
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// Where to write the JSON report. A Markdown copy goes next to it.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "data/bench")]
+        bench_dir: PathBuf,
+        /// Task names; empty runs every task file in --bench-dir.
+        #[arg(long, value_delimiter = ',')]
+        tasks: Vec<String>,
+        #[arg(long, value_delimiter = ',', default_value = "1,2,4,8,16")]
+        loops: Vec<usize>,
+        /// Items per task, 0 for all.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+        #[arg(long, default_value = "tokenizer/tokenizer.json")]
+        tokenizer: PathBuf,
+        /// `cpu`, `cuda`, or `wgpu`.
+        #[arg(long, default_value = "cpu")]
+        device: String,
+        /// Padded tokens per forward pass.
+        #[arg(long, default_value_t = 16384)]
+        token_budget: usize,
+    },
     /// Write DPO preference pairs: reference answers (chosen) vs. the model's own (rejected).
     DpoPairs {
         /// The model whose sampled answers become the rejected side.
@@ -682,6 +710,42 @@ fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 out.display()
             );
         }
+        Command::Bench {
+            checkpoint,
+            out,
+            bench_dir,
+            tasks,
+            loops,
+            limit,
+            tokenizer,
+            device,
+            token_budget,
+        } => {
+            let report = loopmind_train::bench(&loopmind_train::BenchOptions {
+                checkpoint: find_dir(checkpoint)?,
+                bench_dir: find_dir(bench_dir)?,
+                tasks,
+                loops,
+                limit,
+                device,
+                tokenizer: find_file(tokenizer)?,
+                token_budget,
+            })?;
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&out, serde_json::to_string_pretty(&report)? + "\n")?;
+            std::fs::write(
+                out.with_extension("md"),
+                loopmind_train::bench_markdown(&report),
+            )?;
+            let means: Vec<String> = report
+                .mean
+                .iter()
+                .map(|(loops, mean)| format!("{loops} {:.1}%", mean * 100.0))
+                .collect();
+            println!("bench mean {}; report {}", means.join(", "), out.display());
+        }
         Command::DpoPairs {
             checkpoint,
             out,
@@ -766,9 +830,7 @@ fn load_pretrain_config(
 ) -> Result<loopmind_train::PretrainConfig, Box<dyn std::error::Error>> {
     let path = find_file(path)?;
     let mut config = loopmind_train::PretrainConfig::from_path(&path)?;
-    let root = path.parent().and_then(|dir| dir.parent()).ok_or_else(|| {
-        ConfigError::Invalid("pretrain config is not inside a configs directory".into())
-    })?;
+    let root = config_root(&path, "pretrain")?;
     for slot in [&mut config.model, &mut config.data_dir, &mut config.run_dir] {
         if slot.is_relative() {
             *slot = root.join(&*slot);
@@ -777,14 +839,29 @@ fn load_pretrain_config(
     Ok(config)
 }
 
+/// The directory a config's relative paths resolve from: the nearest ancestor of the
+/// config's directory that holds a `Cargo.toml` (the repo root, so `configs/x.toml`,
+/// `configs/whitepaper/x.toml`, and `runs/x.toml` all work), or else the directory above
+/// the config's own.
+fn config_root(path: &Path, kind: &str) -> Result<PathBuf, ConfigError> {
+    let invalid =
+        || ConfigError::Invalid(format!("{kind} config is not inside a configs directory"));
+    let dir = path.parent().ok_or_else(invalid)?;
+    if let Some(root) = dir
+        .ancestors()
+        .find(|ancestor| ancestor.join("Cargo.toml").is_file())
+    {
+        return Ok(root.to_path_buf());
+    }
+    dir.parent().map(Path::to_path_buf).ok_or_else(invalid)
+}
+
 fn load_data_config(
     path: PathBuf,
 ) -> Result<loopmind_data::DataConfig, Box<dyn std::error::Error>> {
     let path = find_file(path)?;
     let mut config = loopmind_data::DataConfig::from_path(&path)?;
-    let root = path.parent().and_then(|dir| dir.parent()).ok_or_else(|| {
-        ConfigError::Invalid("data config is not inside a configs directory".into())
-    })?;
+    let root = config_root(&path, "data")?;
     if config.tokenizer.is_relative() {
         config.tokenizer = root.join(&config.tokenizer);
     }
@@ -797,9 +874,7 @@ fn load_data_config(
 fn load_sft_config(path: PathBuf) -> Result<loopmind_train::SftConfig, Box<dyn std::error::Error>> {
     let path = find_file(path)?;
     let mut config = loopmind_train::SftConfig::from_path(&path)?;
-    let root = path.parent().and_then(|dir| dir.parent()).ok_or_else(|| {
-        ConfigError::Invalid("sft config is not inside a configs directory".into())
-    })?;
+    let root = config_root(&path, "sft")?;
     for slot in [
         &mut config.init,
         &mut config.data_dir,
@@ -816,9 +891,7 @@ fn load_sft_config(path: PathBuf) -> Result<loopmind_train::SftConfig, Box<dyn s
 fn load_dpo_config(path: PathBuf) -> Result<loopmind_train::DpoConfig, Box<dyn std::error::Error>> {
     let path = find_file(path)?;
     let mut config = loopmind_train::DpoConfig::from_path(&path)?;
-    let root = path.parent().and_then(|dir| dir.parent()).ok_or_else(|| {
-        ConfigError::Invalid("dpo config is not inside a configs directory".into())
-    })?;
+    let root = config_root(&path, "dpo")?;
     for slot in [
         &mut config.init,
         &mut config.pairs,

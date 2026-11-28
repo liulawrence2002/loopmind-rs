@@ -116,7 +116,11 @@ pub fn sft(config: &SftConfig, overrides: &RunOverrides) -> Result<RunSummary, T
                 EpochCursor::new(config.seed),
                 0,
                 0,
-                steps_per_epoch.saturating_mul(config.epochs).max(1),
+                if config.total_steps > 0 {
+                    config.total_steps
+                } else {
+                    steps_per_epoch.saturating_mul(config.epochs).max(1)
+                },
             )
         };
     println!(
@@ -128,7 +132,12 @@ pub fn sft(config: &SftConfig, overrides: &RunOverrides) -> Result<RunSummary, T
         rows_per_step,
     );
     let mut last_loss = 0.0f32;
-    while cursor.epoch < config.epochs && (max_steps == 0 || step < max_steps) {
+    let stop_at = if config.total_steps > 0 {
+        config.total_steps
+    } else {
+        u64::MAX
+    };
+    while cursor.epoch < config.epochs && (max_steps == 0 || step < max_steps) && step < stop_at {
         let started = Instant::now();
         let mut rows = Vec::with_capacity(rows_per_step);
         while rows.len() < rows_per_step && cursor.epoch < config.epochs {
@@ -445,6 +454,7 @@ pub(crate) mod tests {
             seed: 9,
             epochs: 50,
             max_steps: 30,
+            total_steps: 0,
             device: "cpu".into(),
             precision: "f32".into(),
             peak_tflops: 1.0,
@@ -468,6 +478,32 @@ pub(crate) mod tests {
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()[key].clone())
             .collect()
+    }
+
+    #[test]
+    fn total_steps_sets_the_schedule_and_the_stop() {
+        let root = std::env::temp_dir().join(format!("loopmind-sft-total-{}", std::process::id()));
+        let mut config = sft_fixture(&root);
+        config.max_steps = 0;
+        config.total_steps = 12;
+        config.log.val_every = 0;
+        config.log.samples = 0;
+        let overrides = RunOverrides {
+            resume: false,
+            max_steps: None,
+            device: None,
+        };
+        let summary = sft(&config, &overrides).unwrap();
+        assert_eq!(summary.steps, 12);
+        let lrs = column(&config.run_dir.join("metrics.jsonl"), "lr");
+        let last = lrs[lrs.len() - 1].as_f64().unwrap();
+        let min = config.optim.min_learning_rate;
+        // The last step sits at the cosine floor of a 12-step schedule.
+        assert!(
+            (last - min) / config.optim.learning_rate < 0.05,
+            "{last} vs {min}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

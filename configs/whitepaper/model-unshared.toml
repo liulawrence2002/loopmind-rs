@@ -1,0 +1,27 @@
+# Whitepaper baseline: a standard 10-layer transformer with the same per-token compute as
+# LoopMind at r = 4 (1 prelude + 2 core x 4 + 1 coda = 10 layer passes), with every layer
+# its own weights: 8 unshared core layers run once. 30.0M parameters, 4.79M active.
+
+d_model = 256
+n_q_heads = 4
+n_kv_heads = 2
+rope_theta = 1000000.0
+rms_norm_eps = 1e-6
+vocab_size = 6400
+tie_embeddings = true
+context_length = 1024
+
+n_prelude_layers = 1
+n_core_layers = 8
+n_coda_layers = 1
+dense_intermediate_size = 768
+
+n_experts = 32
+expert_intermediate_size = 128
+experts_per_token = 2
+reroute_every_pass = true
+
+loop_count_mean = 1.0
+loop_count_max = 1
+bptt_passes = 1
+aux_loss_coef = 1e-2

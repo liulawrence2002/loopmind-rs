@@ -27,7 +27,8 @@ use crate::loopmind::{
     greedy_continue, sample_batch, sample_continue, sample_stream, GenerateOptions, LoopMind,
 };
 use crate::loss::{
-    masked_shifted_logprob_rows, masked_shifted_nll_sum, shifted_token_cross_entropy,
+    masked_shifted_greedy_misses_rows, masked_shifted_logprob_rows, masked_shifted_nll_sum,
+    shifted_token_cross_entropy,
 };
 use crate::rng::TrainRng;
 
@@ -414,6 +415,29 @@ impl PretrainEngine {
             .into_data()
             .try_into_vec::<f32>()
             .map_err(|error| format!("{error:?}"))
+    }
+
+    /// Per-row masked log-probability sum, and whether greedy decoding reproduces every
+    /// supervised target, at a fixed `r` without an autodiff graph. Rows share a width.
+    pub fn score_rows(&self, batch: &SftBatch, loops: usize) -> Result<Vec<(f32, bool)>, String> {
+        let (tokens, mask) = sft_batch(batch, &self.plain_device());
+        let out = self.net().valid().forward(tokens.clone(), loops);
+        let misses =
+            masked_shifted_greedy_misses_rows(out.logits.clone(), tokens.clone(), mask.clone())
+                .into_data()
+                .convert::<i64>()
+                .try_into_vec::<i64>()
+                .map_err(|error| format!("{error:?}"))?;
+        let logprobs = masked_shifted_logprob_rows(out.logits, tokens, mask)
+            .cast(DType::F32)
+            .into_data()
+            .try_into_vec::<f32>()
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(logprobs
+            .into_iter()
+            .zip(misses)
+            .map(|(logprob, missed)| (logprob, missed == 0))
+            .collect())
     }
 
     /// Freeze the weights at `model_path` as the DPO reference, on the plain device.

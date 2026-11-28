@@ -3,6 +3,7 @@
 //! Burn stays in `loopmind-model`. This crate owns the epoch cursor, the
 //! learning-rate schedule, the logs, and the checkpoints.
 
+mod bench;
 mod config;
 mod dpo;
 mod error;
@@ -12,6 +13,10 @@ mod schedule;
 mod score;
 mod sft;
 
+pub use bench::{
+    bench, bench_markdown, choice_rows, headline_metric, read_task, summarize, BenchItem,
+    BenchOptions, BenchReport, TaskScore,
+};
 pub use config::{DpoConfig, PretrainConfig, SftConfig};
 pub use dpo::{dpo, make_pairs, read_pairs, PairOptions, PairReport, PreferencePair};
 pub use error::TrainError;

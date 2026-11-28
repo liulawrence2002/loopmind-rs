@@ -1,0 +1,31 @@
+# SFT data for the whitepaper models: FABLE's English chat and smol-smoltalk (Apache-2.0),
+# without MiniMind's rows, whose card lists CC-BY-NC-2.0. Same English check, eval-overlap
+# drops, trimming, and held-out eval rows as configs/data.toml. Writes data/prepared-wp.
+
+seed = 42
+tokenizer = "tokenizer/tokenizer.json"
+output_dir = "data/prepared-wp"
+python = "python3"
+
+[revisions]
+fineweb = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+cosmopedia = "3ba9d605774198c5868892d7a8deda78031a781f"
+tinystories = "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64"
+fable = "d0bcd6b2181f5588afa9e136a383397dff956620"
+minimind = "312afb4f76391145c6902f765bb51691c09a12f5"
+smoltalk = "f73fe857d519ff6ac5af2ea67c4d3834da7b8bcc"
+
+[pretrain]
+total_tokens = 50_000_000
+context_length = 1024
+val_ratio = 0.01
+shard_sequences = 512
+
+[sft]
+max_tokens = 1024
+eval_rows = 2000
+exclude_cc_by_sa = false
+# English train split of HuggingFaceTB/smol-smoltalk (Apache-2.0) at revisions.smoltalk,
+# the SFT mix for SmolLM2-135M/360M. Its chats are often longer than max_tokens; those
+# keep their first turns instead of being dropped.
+smoltalk = true

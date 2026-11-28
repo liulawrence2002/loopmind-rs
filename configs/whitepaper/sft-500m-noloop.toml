@@ -1,0 +1,41 @@
+# Whitepaper SFT of the no-recurrence baseline after its 500M-token pretrain: 8,000 steps of 16 rows
+# (128,000 rows, about 18% of the FABLE + smol-smoltalk train split, a seeded random
+# sample), with the learning-rate schedule spanning those steps. Same recipe as
+# configs/sft.toml otherwise. Data: configs/whitepaper/data-sft.toml.
+
+init = "runs/wp-500m-noloop"
+data_dir = "data/prepared-wp/sft"
+run_dir = "runs/wp-sft-noloop"
+tokenizer = "tokenizer/tokenizer.json"
+seed = 42
+epochs = 1
+max_steps = 0
+total_steps = 8000
+device = "cuda"
+precision = "f32"
+peak_tflops = 15.0
+pad_multiple = 64
+val_loops = [1, 2, 4, 8]
+
+[optim]
+learning_rate = 1.0e-4
+min_learning_rate = 1.0e-5
+weight_decay = 0.1
+beta1 = 0.9
+beta2 = 0.95
+epsilon = 1.0e-8
+grad_clip = 1.0
+warmup_steps = 100
+
+[batch]
+rows_per_step = 16
+
+[log]
+every = 1
+val_every = 500
+val_rows = 128
+samples = 8
+
+[checkpoint]
+every = 500
+keep = 2
