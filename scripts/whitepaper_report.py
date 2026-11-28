@@ -110,6 +110,78 @@ def task_table(rows: list[tuple[str, dict, str]]) -> list[str]:
     return out
 
 
+# Static figures for the paper: light surface, the reference categorical order, 2px lines,
+# 8px markers with a surface ring, a legend plus end-of-line labels, recessive grid.
+SERIES = ["#257de0", "#f47230", "#00b894", "#f2a600"]
+INK, INK2, GRID, AXIS, SURFACE = "#191919", "#666666", "#e7e7e7", "#c2c2c2", "#ffffff"
+
+
+def nice_step(span: float) -> float:
+    raw = span / 5
+    for step in (0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, 100):
+        if step >= raw:
+            return step
+    return raw
+
+
+def line_chart(path: Path, title: str, x_label: str, y_label: str, series, refs=(), log2=False, x_fmt=str) -> None:
+    """series: (name, [(x, y)]) in fixed slot order; refs: (name, y) dashed reference lines."""
+    import math
+    width, height, left, right, top, bottom = 680, 380, 60, 170, 64, 52
+    xs = [x for _, points in series for x, _ in points]
+    ys = [y for _, points in series for _, y in points] + [y for _, y in refs]
+    if not xs:
+        return
+    fx = (lambda x: math.log2(x)) if log2 else (lambda x: x)
+    x0, x1 = min(map(fx, xs)), max(map(fx, xs))
+    x1 = x1 if x1 > x0 else x0 + 1
+    step = nice_step(max(ys) - min(ys) or 1)
+    y0 = math.floor((min(ys) - step / 2) / step) * step
+    y1 = math.ceil((max(ys) + step / 2) / step) * step
+    px = lambda x: left + (fx(x) - x0) / (x1 - x0) * (width - left - right)
+    py = lambda y: top + (y1 - y) / (y1 - y0) * (height - top - bottom)
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" font-family="Inter, Helvetica, Arial, sans-serif">',
+           f'<rect width="{width}" height="{height}" fill="{SURFACE}"/>',
+           f'<text x="{left}" y="22" font-size="15" font-weight="600" fill="{INK}">{title}</text>']
+    y = y0
+    while y <= y1 + 1e-9:
+        out.append(f'<line x1="{left}" x2="{width - right}" y1="{py(y):.1f}" y2="{py(y):.1f}" stroke="{GRID}" stroke-width="1"/>')
+        out.append(f'<text x="{left - 8}" y="{py(y) + 4:.1f}" font-size="11" fill="{INK2}" text-anchor="end">{y:g}</text>')
+        y += step
+    for x in sorted(set(xs)):
+        out.append(f'<text x="{px(x):.1f}" y="{height - bottom + 18}" font-size="11" fill="{INK2}" text-anchor="middle">{x_fmt(x)}</text>')
+    out.append(f'<line x1="{left}" x2="{width - right}" y1="{height - bottom}" y2="{height - bottom}" stroke="{AXIS}" stroke-width="1"/>')
+    out.append(f'<text x="{(left + width - right) / 2:.1f}" y="{height - 10}" font-size="12" fill="{INK2}" text-anchor="middle">{x_label}</text>')
+    out.append(f'<text transform="translate(16 {(top + height - bottom) / 2:.1f}) rotate(-90)" font-size="12" fill="{INK2}" text-anchor="middle">{y_label}</text>')
+    labels = []  # (y in px, x in px, text, ink): end-of-line and reference labels, spaced below
+    for name, value in refs:
+        out.append(f'<line x1="{left}" x2="{width - right}" y1="{py(value):.1f}" y2="{py(value):.1f}" stroke="{INK2}" stroke-width="1.5" stroke-dasharray="5 4"/>')
+        labels.append((py(value), width - right + 8, f"{name} {value:.1f}", INK2))
+    legend_x = left
+    for index, (name, points) in enumerate(series):
+        color = SERIES[index % len(SERIES)]
+        out.append(f'<line x1="{legend_x}" x2="{legend_x + 18}" y1="42" y2="42" stroke="{color}" stroke-width="2"/>')
+        out.append(f'<circle cx="{legend_x + 9}" cy="42" r="4" fill="{color}" stroke="{SURFACE}" stroke-width="2"/>')
+        out.append(f'<text x="{legend_x + 24}" y="46" font-size="12" fill="{INK}">{name}</text>')
+        legend_x += 34 + 7 * len(name)
+        points = sorted(points)
+        path_d = " ".join(f"{'M' if i == 0 else 'L'}{px(x):.1f},{py(y):.1f}" for i, (x, y) in enumerate(points))
+        out.append(f'<path d="{path_d}" fill="none" stroke="{color}" stroke-width="2" stroke-linejoin="round"/>')
+        for x, y in points:
+            out.append(f'<circle cx="{px(x):.1f}" cy="{py(y):.1f}" r="4" fill="{color}" stroke="{SURFACE}" stroke-width="2"><title>{name}: {y:.1f} at {x_fmt(x)}</title></circle>')
+        last_x, last_y = points[-1]
+        labels.append((py(last_y), px(last_x) + 10, f"{name} {last_y:.1f}", INK))
+    labels.sort()
+    placed = []
+    for y_px, x_px, text, ink in labels:
+        if placed and y_px < placed[-1] + 13:
+            y_px = placed[-1] + 13
+        placed.append(y_px)
+        out.append(f'<text x="{x_px:.1f}" y="{y_px + 4:.1f}" font-size="11" fill="{ink}">{text}</text>')
+    out.append("</svg>")
+    path.write_text("\n".join(out) + "\n")
+
+
 def main() -> None:
     WP.mkdir(parents=True, exist_ok=True)
     picked = choices()
@@ -156,6 +228,14 @@ def main() -> None:
             out.append(f"| {label} | " + " | ".join(cells) + " |")
             for key, value in report["mean"].items():
                 scaling.append({"model": label, "loops": loops_of(key), "mean": value})
+        looped = [(label.replace("LoopMind, ", ""), [(loops_of(k), 100 * v) for k, v in report["mean"].items()])
+                  for label, report in have if len(report["mean"]) > 1]
+        refs = [(label.split(" (")[0], 100 * report["mean"]["r1"]) for label, report in have
+                if len(report["mean"]) == 1 and "r1" in report["mean"]]
+        if looped:
+            line_chart(WP / "fig-scaling-50m.svg", "Benchmark mean by loop count at inference, 50M tokens",
+                       "loops at inference (r)", "mean accuracy, %", looped, refs, log2=True)
+            out += ["![Benchmark mean by r at 50M tokens](fig-scaling-50m.svg)", ""]
         with open(WP / "scaling-50m.csv", "w", newline="") as handle:
             writer = csv.DictWriter(handle, ["model", "loops", "mean"])
             writer.writeheader()
@@ -170,6 +250,13 @@ def main() -> None:
         rows = [(label, report, best(report)[0]) for label, _, report in big_reports if report]
         out += task_table(rows)
         loop_report = big_reports[0][2]
+        base_report = big_reports[1][2]
+        if loop_report and len(loop_report["mean"]) > 1:
+            refs = [("No recurrence", 100 * base_report["mean"]["r1"])] if base_report and "r1" in base_report["mean"] else []
+            line_chart(WP / "fig-scaling-500m.svg", "Benchmark mean by loop count at inference, 500M tokens",
+                       "loops at inference (r)", "mean accuracy, %",
+                       [("LoopMind", [(loops_of(k), 100 * v) for k, v in loop_report["mean"].items()])], refs, log2=True)
+            out += ["", "![Benchmark mean by r at 500M tokens](fig-scaling-500m.svg)"]
         if loop_report:
             out += ["", "LoopMind at 500M tokens by r: " + ", ".join(
                 f"r = {loops_of(k)}: {pct(v)}" for k, v in sorted(loop_report["mean"].items(), key=lambda kv: loops_of(kv[0])))]
@@ -196,9 +283,14 @@ def main() -> None:
             writer = csv.DictWriter(handle, ["model", "step", "tokens", "loops", "mean"])
             writer.writeheader()
             writer.writerows(curve)
-        series = sorted({(row["model"], row["loops"]) for row in curve})
+        series = sorted({(row["model"], row["loops"]) for row in curve}, key=lambda s: (s[0] != "loop", s[1]))
+        line_chart(WP / "fig-curve-500m.svg", "Benchmark mean while training on 500M tokens (1,000 items per task)",
+                   "tokens seen", "mean accuracy, %",
+                   [(f"{'LoopMind' if m == 'loop' else 'No recurrence'} r = {r}",
+                     [(row["tokens"], 100 * row["mean"]) for row in curve if row["model"] == m and row["loops"] == r])
+                    for m, r in series], x_fmt=lambda x: f"{x / 1e6:.0f}M")
         steps = sorted({row["step"] for row in curve})
-        out += ["## Learning curves (1,000 items per task)", "",
+        out += ["## Learning curves (1,000 items per task)", "", "![Learning curves](fig-curve-500m.svg)", "",
                 "| Tokens seen | " + " | ".join(f"{m} r = {r}" for m, r in series) + " |",
                 "| ---: |" + " ---: |" * len(series)]
         for step in steps:
