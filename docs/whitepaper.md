@@ -99,7 +99,7 @@ The headline number is the mean over the eight tasks. At 10M parameters, several
 
 ### 4.4 Instruction tuning
 
-Both 500M models get the same SFT: 8,000 steps of 16 conversations, with a cosine learning rate from 1e-4 to 1e-5. The data is a seeded random sample of FABLE's English chat and smol-smoltalk (Ben Allal et al., 2025), filtered to English answers, with any row that repeats an eval prompt dropped. MiniMind's data is left out because its licence includes CC-BY-NC. The tuned models are scored on the same benchmarks, plus FABLE's 2,000 held-out questions in math, logic, science, and JSON ([sft.md](sft.md), [refine.md](refine.md)).
+Both 500M models get the same SFT: 8,000 steps of 16 conversations, with a cosine learning rate from 1e-4 to 1e-5. That is 128,000 conversations, 21% of the 600,620-row training split, a seeded random sample of FABLE's English chat and smol-smoltalk (Ben Allal et al., 2025), filtered to English answers, with any row that repeats an eval prompt dropped. MiniMind's data is left out because its licence includes CC-BY-NC. The tuned models are scored on the same benchmarks, plus FABLE's 2,000 held-out questions in math, logic, science, and JSON ([sft.md](sft.md), [refine.md](refine.md)).
 
 ### 4.5 Decision rules
 

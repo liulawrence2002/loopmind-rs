@@ -1,5 +1,5 @@
 # Whitepaper SFT of LoopMind after its 500M-token pretrain: 8,000 steps of 16 rows
-# (128,000 rows, about 18% of the FABLE + smol-smoltalk train split, a seeded random
+# (128,000 rows, 21% of the 600,620-row FABLE + smol-smoltalk train split, a seeded random
 # sample), with the learning-rate schedule spanning those steps. Same recipe as
 # configs/sft.toml otherwise. Data: configs/whitepaper/data-sft.toml.
 
