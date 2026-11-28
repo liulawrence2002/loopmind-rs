@@ -34,7 +34,7 @@ Each new width costs CubeCL kernel compiles and an autotune pass, so 64 was fast
 | `epochs` | 2 | 19,190 steps |
 | `learning_rate` | 1e-4 | a third of the pretrain peak; cosine floor 1e-5, warmup 100 |
 | `weight_decay` | 0.1 | as pretrain |
-| `val_every` | 500 | masked loss on the first 128 `eval.jsonl` rows at r = 1, 2, 4, 8 |
+| `val_every` | 500 | masked loss on the first 128 `eval.jsonl` rows (all `math_reasoning`) at r = 1, 2, 4, 8 |
 | `checkpoint.every` | 500 | keep 3 |
 | `samples` | 4 | greedy answers at r = 4 to the first eval prompts, printed at the end and written to `runs/sft/samples.txt` |
 
@@ -80,6 +80,47 @@ runs/sft-mix-supervisor.sh   # resumes up to 5 times, then evaluates into runs/e
 ```
 
 The supervisor script is local, like `runs/sft-supervisor.sh`. After training, it evaluates on the same 2,000 held-out rows as `runs/eval/sft.json`: masked loss at r = 1, 2, 4, 8, 16, and greedy answers at r = 4 and 8.
+
+### Results
+
+On 2026-11-27 and 28, from the same pretrain checkpoint, the run took 11 h 54 min of training in two sittings:
+- 25,500 steps until a planned pause at 16:38;
+- the remaining 18,243 steps after a reboot, resumed from checkpoint 25,500 with no steps lost.
+
+CUDA failed after the laptop woke from suspend (`CUDA_ERROR_UNKNOWN`), and the reboot fixed it. `runs/sft-mix-pause.sh` and `runs/sft-mix-resume.sh` handled the pause and the restart. They are local, like the supervisor.
+
+The run covered all 43,743 steps in CUDA f32. It averaged 8,480 padded tokens/s (MFU 1.8%) and a mean sampled `r` of 4.01. It covered 371.0M padded tokens and 255.0M supervised targets.
+
+| Step | r = 1 | r = 2 | r = 4 | r = 8 |
+| ---: | ---: | ---: | ---: | ---: |
+| 500 | 3.520 | 3.404 | 3.415 | 3.523 |
+| 5,000 | 2.342 | 2.189 | 2.150 | 2.256 |
+| 10,000 | 2.042 | 1.905 | 1.880 | 1.951 |
+| 20,000 | 1.841 | 1.703 | 1.670 | 1.719 |
+| 30,000 | 1.740 | 1.612 | 1.583 | 1.634 |
+| 43,743 | **1.688** | **1.560** | **1.530** | **1.577** |
+
+Validation masked loss on the first 128 eval rows. Those rows are all `math_reasoning`, so this curve measures math only. On it the mix ends below `runs/sft` (1.556 at r = 4) and just above `runs/sft-refine` (1.520).
+
+The full eval covers all 2,000 rows, 500 per config, and the answers on 148 of them. There the mix is worse:
+
+| | `runs/sft` | `runs/sft-refine` | `runs/sft-mix` |
+| --- | ---: | ---: | ---: |
+| loss, r = 4 | 1.037 | **1.008** | 1.174 |
+| loss, r = 8 | 1.083 | **1.051** | 1.232 |
+| macro accuracy, r = 8 greedy | 13.0% | **16.1%** | 11.0% |
+| math | 2/50 | 1/50 | 2/50 |
+| logic | 1/30 | 2/30 | 2/30 |
+| science | 8/24 | 9/24 | 8/24 |
+| JSON exact | 5/44 | **8/44** | 0/44 |
+| JSON valid | 82% | 82% | 58% |
+
+- The loss is higher at every `r`. The 128 math rows improved, so most of the rise is likely in the other three configs.
+- JSON fell the most: exact matches went from 8 to 0 of 44, and valid JSON from 82% to 58%. FABLE is now 15% of the tokens, and smol-smoltalk answers in prose. Asked for a JSON object for Ana, who is 30, the model replies with a sentence about writing one.
+- Answers at r = 8 beat r = 4 (11.0% against 8.4%), while the loss is lowest at r = 4. Both match the earlier runs.
+- In the chat smoke prompts, the model now names Paris as the capital of France, where `runs/sft-refine` answered "The capital of France is the capital of France." Greedy answers still fall into loops that repeat one phrase, and the arithmetic is still wrong (12 + 7 = 12).
+
+The keep rule for this run was macro accuracy at r = 8 greedy of at least `runs/sft-refine`'s 16.1%. The mix reached 11.0%, so `runs/best.json` stays on `runs/sft-refine`. The checkpoint stays in `runs/sft-mix` and can be chosen on the chat page.
 
 ## Chat
 
