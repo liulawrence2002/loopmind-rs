@@ -33,6 +33,10 @@ pub struct Revisions {
     /// fingerprint when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smoltalk: Option<String>,
+    /// Commit of `wikimedia/wikipedia`, for the `simplewiki` pretrain source (config
+    /// `20231101.simple`). Left out of the build fingerprint when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simplewiki: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,7 +45,28 @@ pub struct PretrainConfig {
     pub context_length: usize,
     pub val_ratio: f64,
     pub shard_sequences: usize,
+    /// Sources and their whole-percent shares, in build order (`[[pretrain.mix]]`).
+    /// Unset means the 50/20/20/10 mix of fineweb, cosmopedia, tinystories, and
+    /// fable-wiki, and is left out of the build fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix: Option<Vec<MixEntry>>,
 }
+
+/// One source's share of `pretrain.total_tokens`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MixEntry {
+    pub source: String,
+    pub percent: u64,
+}
+
+/// Sources `[[pretrain.mix]]` may name.
+pub const PRETRAIN_SOURCES: [&str; 5] = [
+    "fineweb",
+    "cosmopedia",
+    "tinystories",
+    "fable-wiki",
+    "simplewiki",
+];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SftConfig {
@@ -102,11 +127,61 @@ impl DataConfig {
                 "sft.minimind_file needs revisions.minimind (a dataset commit)",
             ));
         }
+        if let Some(mix) = &self.pretrain.mix {
+            let mut seen = Vec::new();
+            for entry in mix {
+                if !PRETRAIN_SOURCES.contains(&entry.source.as_str()) {
+                    return Err(DataError::new(format!(
+                        "pretrain.mix names unknown source {}; known: {}",
+                        entry.source,
+                        PRETRAIN_SOURCES.join(", ")
+                    )));
+                }
+                if seen.contains(&entry.source) {
+                    return Err(DataError::new(format!(
+                        "pretrain.mix names {} twice",
+                        entry.source
+                    )));
+                }
+                if entry.percent == 0 {
+                    return Err(DataError::new(format!(
+                        "pretrain.mix gives {} 0 percent",
+                        entry.source
+                    )));
+                }
+                self.revision(&entry.source)?;
+                seen.push(entry.source.clone());
+            }
+            let total: u64 = mix.iter().map(|entry| entry.percent).sum();
+            if total != 100 {
+                return Err(DataError::new(format!(
+                    "pretrain.mix percents sum to {total}, not 100"
+                )));
+            }
+        }
         Ok(())
     }
 
-    pub fn pretrain_budgets(&self) -> [(&'static str, u64); 4] {
-        scaled_budgets(self.pretrain.total_tokens)
+    /// Token budget per source, in build order, summing to `pretrain.total_tokens`.
+    /// With `pretrain.mix`, each source gets its whole percent and the last one absorbs
+    /// the remainder of the integer division.
+    pub fn pretrain_budgets(&self) -> Vec<(String, u64)> {
+        let total = self.pretrain.total_tokens;
+        let Some(mix) = &self.pretrain.mix else {
+            return scaled_budgets(total)
+                .iter()
+                .map(|(name, tokens)| (name.to_string(), *tokens))
+                .collect();
+        };
+        let mut budgets: Vec<(String, u64)> = mix
+            .iter()
+            .map(|entry| (entry.source.clone(), total * entry.percent / 100))
+            .collect();
+        let assigned: u64 = budgets.iter().map(|(_, tokens)| tokens).sum();
+        if let Some((_, last)) = budgets.last_mut() {
+            *last += total - assigned;
+        }
+        budgets
     }
 
     pub fn packed_tokens(budget: u64, seq_len: usize) -> u64 {
@@ -131,6 +206,11 @@ impl DataConfig {
                 .smoltalk
                 .as_deref()
                 .ok_or_else(|| DataError::new("revisions.smoltalk is not set"))?,
+            "simplewiki" => self
+                .revisions
+                .simplewiki
+                .as_deref()
+                .ok_or_else(|| DataError::new("revisions.simplewiki is not set"))?,
             _ => return Err(DataError::new(format!("unknown source {source}"))),
         })
     }
@@ -161,8 +241,13 @@ mod tests {
             .is_some_and(|file| file.ends_with("sft_t2t_mini.jsonl")));
         assert!(config.sft.smoltalk);
         assert_eq!(config.revision("smoltalk").unwrap().len(), 40);
+        assert!(config.pretrain.mix.is_none());
         assert_eq!(
-            config.pretrain_budgets().map(|(_, tokens)| tokens),
+            config
+                .pretrain_budgets()
+                .iter()
+                .map(|(_, tokens)| *tokens)
+                .collect::<Vec<_>>(),
             [25_000_000, 10_000_000, 10_000_000, 5_000_000]
         );
         assert_eq!(config.revision("fineweb").unwrap().len(), 40);
@@ -183,5 +268,72 @@ mod tests {
         config.sft.minimind_file = None;
         config.sft.smoltalk = true;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn the_500m_config_splits_its_mix_by_percent() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/data-500m.toml");
+        let config = DataConfig::from_path(&path).unwrap();
+        assert_eq!(config.pretrain.total_tokens, 500_000_000);
+        let budgets = config.pretrain_budgets();
+        let names: Vec<&str> = budgets.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "fineweb",
+                "cosmopedia",
+                "simplewiki",
+                "tinystories",
+                "fable-wiki"
+            ]
+        );
+        let tokens: Vec<u64> = budgets.iter().map(|(_, tokens)| *tokens).collect();
+        assert_eq!(
+            tokens,
+            [265_000_000, 125_000_000, 50_000_000, 50_000_000, 10_000_000]
+        );
+        assert_eq!(config.revision("simplewiki").unwrap().len(), 40);
+        assert_ne!(config.output_dir, Path::new("data/prepared"));
+    }
+
+    #[test]
+    fn a_mix_must_name_known_sources_once_and_sum_to_100() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/data-500m.toml");
+        let base = DataConfig::from_path(&path).unwrap();
+        let with = |mix: &[(&str, u64)]| {
+            let mut config = base.clone();
+            config.pretrain.total_tokens = 1_001;
+            config.pretrain.mix = Some(
+                mix.iter()
+                    .map(|(source, percent)| MixEntry {
+                        source: source.to_string(),
+                        percent: *percent,
+                    })
+                    .collect(),
+            );
+            config
+        };
+        let config = with(&[("fineweb", 50), ("tinystories", 50)]);
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.pretrain_budgets(),
+            [
+                ("fineweb".to_string(), 500),
+                ("tinystories".to_string(), 501)
+            ]
+        );
+        assert!(with(&[("fineweb", 60), ("tinystories", 50)])
+            .validate()
+            .is_err());
+        assert!(with(&[("fineweb", 50), ("fineweb", 50)])
+            .validate()
+            .is_err());
+        assert!(with(&[("wikipedia", 100)]).validate().is_err());
+        assert!(with(&[("fineweb", 100), ("tinystories", 0)])
+            .validate()
+            .is_err());
+        let mut missing = with(&[("simplewiki", 100)]);
+        missing.revisions.simplewiki = None;
+        assert!(missing.validate().is_err());
     }
 }

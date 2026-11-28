@@ -11,7 +11,7 @@ mod pretrain;
 mod sft;
 mod shard;
 
-pub use config::DataConfig;
+pub use config::{DataConfig, MixEntry, PRETRAIN_SOURCES};
 pub use error::DataError;
 pub use loader::{
     epoch_order, read_sft_eval, split_final_answer, EpochCursor, PretrainBatch, PretrainLoader,

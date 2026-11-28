@@ -115,6 +115,13 @@ cargo run -p loopmind --release --features cuda -- chat --device cuda   # uses r
 cargo run -p loopmind --release --features cuda -- serve --device cuda  # chat page at http://127.0.0.1:8080
 ```
 
+The 500M-token pretrain (see [docs/pretrain.md](docs/pretrain.md#the-500m-run)):
+
+```bash
+cargo run -p loopmind --release -- prepare-pretrain --config configs/data-500m.toml
+setsid nohup scripts/pretrain-500m.sh > /dev/null 2>&1 &   # about 11-12 h on the 4070
+```
+
 Train and use the tokenizer:
 
 ```bash

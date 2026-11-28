@@ -1,0 +1,51 @@
+# One epoch of the 500M-token mix in configs/data-500m.toml, on the RTX 4070 Laptop.
+# Same model and loop sampling as the 50M run (configs/default.toml: loop mean 4, max 16,
+# gradients through the last 4 passes). See docs/pretrain.md, "The 500M run".
+#
+# 32 sequences of 1024 tokens per step: 32,768 tokens, 15,259 steps. That is 4x the
+# 50M run's batch, with the peak learning rate doubled (square-root scaling). It is still a
+# small batch for pretraining. The learning rate is the one setting not yet tried on this
+# model; docs/pretrain.md has a short check to run first.
+#
+# Start it with scripts/pretrain-500m.sh, which resumes after a crash.
+
+model = "configs/default.toml"
+data_dir = "data/prepared-500m/pretrain"
+run_dir = "runs/pretrain-500m"
+seed = 42
+epochs = 1
+max_steps = 0
+device = "cuda"
+precision = "f32"
+peak_tflops = 15.0
+# r = 16 is the largest loop count training samples. It shows whether extra loops at
+# inference help or hurt, which is the claim a recurrent-depth model has to back.
+val_loops = [1, 2, 4, 8, 16]
+
+[optim]
+learning_rate = 6.0e-4
+min_learning_rate = 6.0e-5
+weight_decay = 0.1
+beta1 = 0.9
+beta2 = 0.95
+epsilon = 1.0e-8
+grad_clip = 1.0
+# About 2% of the steps, 9.8M tokens.
+warmup_steps = 300
+
+[batch]
+micro_batch = 1
+tokens_per_step = 32768
+
+[log]
+every = 1
+# Every 8.2M tokens, on 64 val sequences (64K tokens, a seeded draw across the sources'
+# val shards, so roughly in mix proportion).
+val_every = 250
+val_sequences = 64
+
+[checkpoint]
+# Every 8.2M tokens, about 11 minutes. Every checkpoint is kept (62 with the final one,
+# 114 MB each, about 7 GB) so benchmarks can be scored against tokens seen.
+every = 250
+keep = 64

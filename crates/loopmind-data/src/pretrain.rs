@@ -93,12 +93,12 @@ pub fn prepare_pretrain(
     let script = find_script()?;
     let mut sources = Vec::new();
     for (name, budget) in config.pretrain_budgets() {
-        let revision = config.revision(name)?.to_string();
+        let revision = config.revision(&name)?.to_string();
         let report = ingest_hf_source(
             config,
             tokenizer,
             &script,
-            name,
+            &name,
             &revision,
             budget,
             eos as u16,

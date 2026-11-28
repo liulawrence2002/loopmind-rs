@@ -35,6 +35,47 @@ Validation is extra, not taken out of the train budget. A stable hash of `(seed,
 
 Shards are little-endian `u16` files (`vocab` is 6400). The header is magic `LMDP`, version `u16`, sequence length `u16`, sequence count `u32`, then `count * seq_len` token ids. `pretrain/manifest.json` records the token counts, shard paths, and sha256 of each file. Default shard size is 512 sequences.
 
+### The 500M mix
+
+`configs/data-500m.toml` builds the data for the 500M run ([pretrain.md](pretrain.md#the-500m-run)) into `data/prepared-500m`. It lists its sources in `[[pretrain.mix]]` tables, each with a whole-percent share, in build order:
+
+```toml
+[[pretrain.mix]]
+source = "fineweb"
+percent = 53
+```
+
+Each source gets `total_tokens * percent / 100`, and the last one absorbs the remainder. The shares must sum to 100. Each source may appear once and must be one of `fineweb`, `cosmopedia`, `tinystories`, `fable-wiki`, or `simplewiki`. Without `[[pretrain.mix]]`, the build uses the 50/20/20/10 mix above. The field is then left out of the fingerprint, so `configs/data.toml` builds are unaffected.
+
+| Source | Dataset | Share | Budget | Licence |
+| --- | --- | ---: | ---: | --- |
+| fineweb | `HuggingFaceFW/fineweb-edu`, `sample-10BT` | 53% | 265M | ODC-By |
+| cosmopedia | `HuggingFaceTB/smollm-corpus`, `cosmopedia-v2` | 25% | 125M | ODC-By |
+| simplewiki | `wikimedia/wikipedia`, `20231101.simple`, revision `b04c8d1ceb2f5cd4588862100d08de323dccfbaa` | 10% | 50M | CC-BY-SA-3.0 and GFDL |
+| tinystories | `roneneldan/TinyStories` | 10% | 50M | CDLA-Sharing-1.0 |
+| fable-wiki | `KeremTT/FABLE-5.2-MAX-DATABASE`, `raw_text_corpus`, English | 2% | 10M | per row (`other` on the card) |
+
+The mix moves from 50/20/20/10 for three reasons:
+
+- **FABLE's text corpus is small.** It has 10,000 English rows, about 16M tokens with this tokenizer. That is too few for 10% of 500M, so it drops to 2%.
+- **Simple English Wikipedia adds facts.** Its 241,787 articles define things in plain language, such as "April is the fourth month of the year". The articles are short (median 514 characters) and total about 75M tokens, so 50M leaves room.
+- **Fewer stories.** TinyStories drops from 20% to 10%, which is still five times the 50M run's stories. The target is answering questions, not telling stories, so Cosmopedia's textbook-style text rises to 25%.
+
+Every source streams from its first row. A smaller `total_tokens` with the same mix therefore reads a prefix of each source, so a 50M build of this mix holds the same documents as the start of the 500M one.
+
+Measured on the 4070 box on 2026-11-28, the build took 631.6 s and wrote 968 MB:
+
+| Source | Train tokens | Val tokens | Documents read |
+| --- | ---: | ---: | ---: |
+| fineweb | 264,999,936 | 2,649,088 | 206,035 |
+| cosmopedia | 124,999,680 | 1,249,280 | 134,931 |
+| simplewiki | 49,999,872 | 499,712 | 137,962 |
+| tinystories | 49,999,872 | 499,712 | 208,896 |
+| fable-wiki | 9,999,360 | 99,328 | 6,279 |
+| **Total** | **499,998,720** | **4,997,120** | **694,103** |
+
+Simple English Wikipedia used 137,962 of its 241,787 articles, and FABLE 6,279 of its 10,000 English rows.
+
 ## SFT
 
 English chat rows from FABLE, excluding `raw_text_corpus` and the `turkish_language` config, then optionally MiniMind's and smol-smoltalk's English rows, in that order. A FABLE row's `language` must be `en` or `english`. Rows are rendered with the M2 chat template (`<|bos|>`, role turns, `<|eos|>` when the transcript ends on an assistant turn). The loss mask is 1 on assistant content, the `<|im_end|>` that closes it, and that final `<|eos|>`.

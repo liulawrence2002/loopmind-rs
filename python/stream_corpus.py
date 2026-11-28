@@ -19,6 +19,7 @@ PRETRAIN = {
     "cosmopedia": ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", "text"),
     "tinystories": ("roneneldan/TinyStories", None, "text"),
     "fable-wiki": ("KeremTT/FABLE-5.2-MAX-DATABASE", "raw_text_corpus", "wiki"),
+    "simplewiki": ("wikimedia/wikipedia", "20231101.simple", "text"),
 }
 
 # FABLE configs the eval rows are drawn from. Prompts from these are kept aside so the

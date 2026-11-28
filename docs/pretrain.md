@@ -121,6 +121,62 @@ At step 5,701 the run ran out of device memory on an ordinary training step. Pas
 
 Resumed from the step-5,600 checkpoint, steps 5,601–5,604 reproduced the crashed run's loss, grad norm, and loop counts to four decimals.
 
+## The 500M run
+
+Ready, not started. The data is built in `data/prepared-500m` (2026-11-28). The 50M run gave about 5 tokens per parameter. That is far below the roughly 20 per parameter usually taken as compute-optimal, and small models are now trained well past that. Its base model knows few facts: before SFT it could not finish "The capital of France is". SFT cannot add what pretraining missed. The 500M run gives about 50 tokens per parameter, or about 210 per active parameter.
+
+```bash
+./target/release/loopmind prepare-pretrain --config configs/data-500m.toml   # 11 min, CPU only (done)
+setsid nohup scripts/pretrain-500m.sh > /dev/null 2>&1 &                     # about 11-12 h on the 4070
+tail -f runs/pretrain-500m/train.log
+```
+
+`scripts/pretrain-500m.sh` resumes from the latest checkpoint when `runs/pretrain-500m/latest.json` exists, including on its first attempt. It trims `metrics.jsonl` back to that checkpoint and retries up to 5 times. To pause, kill the script first, then the trainer, and run the script again to continue. After a laptop suspend, CUDA can fail with `CUDA_ERROR_UNKNOWN` until `nvidia_uvm` is reloaded or the machine reboots. Stop the run before closing the lid.
+
+| | 50M run | 500M run |
+| --- | --- | --- |
+| Data config | `configs/data.toml` | `configs/data-500m.toml` |
+| Mix | FineWeb-Edu 50%, Cosmopedia 20%, TinyStories 20%, FABLE text 10% | FineWeb-Edu 53%, Cosmopedia 25%, Simple English Wikipedia 10%, TinyStories 10%, FABLE text 2% ([data.md](data.md#the-500m-mix)) |
+| Tokens per step | 8,192 | 32,768 |
+| Steps | 6,104 | 15,259 |
+| Peak learning rate | 3e-4, floor 3e-5 | 6e-4, floor 6e-5 |
+| Warmup | 100 steps | 300 steps (9.8M tokens) |
+| Validation | every 200 steps, 16 sequences, r = 1, 2, 4, 8 | every 250 steps, 64 sequences, r = 1, 2, 4, 8, 16 |
+| Checkpoints | every 200 steps, keep 2 | every 250 steps and at the end, all kept (62, about 7 GB) |
+
+The model, the loop sampling (clamped Poisson, mean 4, max 16, gradients through the last 4 passes), f32, AdamW, weight decay, gradient clipping, context, and seed are unchanged.
+
+- **Batch and learning rate.** Four times the batch means a quarter of the optimizer steps per token. The peak learning rate is doubled, the square-root rule for a 4x batch. That learning rate is the one setting this model has not trained at.
+- **Validation at r = 16.** Training samples up to 16 loops. A recurrent-depth model is supposed to improve, or at least hold, with more loops at inference. The 50M model got worse past r = 4, so this column tracks whether more data changes that.
+- **Every checkpoint kept.** Benchmarks can then be scored against tokens seen, every 8.2M tokens.
+
+With fused experts, the 50M run trained at about 12,000 tokens/s, 13,300 at its end, or about 70 minutes per epoch. At that rate 500M tokens take about 10.4-11.6 h, plus about 20 minutes of validation.
+
+### Before launching
+
+1. **CUDA check (2 minutes).** After a suspend, CUDA fails until the driver is reloaded (`sudo rmmod nvidia_uvm && sudo modprobe nvidia_uvm`) or the machine reboots. The script stops on that error rather than retrying. Twenty steps with validation at step 10 and 20 confirm the speed and the memory, including r = 16. A config must sit inside the repo, because its paths resolve from the repo root.
+
+   ```bash
+   sed -e 's|^run_dir = .*|run_dir = "runs/smoke-500m"|' -e 's|^val_every = .*|val_every = 10|' \
+       configs/pretrain-500m.toml > runs/smoke-500m.toml
+   ./target/release/loopmind pretrain --config runs/smoke-500m.toml --max-steps 20
+   rm -rf runs/smoke-500m runs/smoke-500m.toml
+   ```
+
+   On 2026-11-28 the CPU version of this check passed: one step, validation at all five loop counts, and a 114 MB checkpoint. The GPU version waits on a driver reload.
+
+2. **Learning-rate check (about 30 minutes, optional).** Run 300 steps at each peak rate, and keep 6e-4 if its validation loss at step 250 is lower and its gradient norm has no spikes. `--max-steps` stops early on the full run's schedule, so these steps match the real run's first 300.
+
+   ```bash
+   sed 's|runs/pretrain-500m|runs/lr-check-6e-4|' configs/pretrain-500m.toml > runs/lr-6e-4.toml
+   sed -e 's|runs/pretrain-500m|runs/lr-check-3e-4|' -e 's|^learning_rate = 6.0e-4|learning_rate = 3.0e-4|' \
+       -e 's|^min_learning_rate = 6.0e-5|min_learning_rate = 3.0e-5|' configs/pretrain-500m.toml > runs/lr-3e-4.toml
+   ./target/release/loopmind pretrain --config runs/lr-6e-4.toml --max-steps 300
+   ./target/release/loopmind pretrain --config runs/lr-3e-4.toml --max-steps 300
+   ```
+
+3. **Loop depth.** If a 50M-token comparison shows that a deeper loop mean makes extra loops help, set `loop_count_mean` in the model config before this run. A mean of 8 runs more forward passes but the same 4 backward passes, about a quarter slower.
+
 ## Greedy samples
 
 ```bash

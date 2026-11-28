@@ -1,0 +1,61 @@
+# The 500M-token pretrain build for configs/pretrain-500m.toml (docs/pretrain.md, "The 500M
+# run"). It writes to its own output_dir, so the 50M build in data/prepared stays as it is.
+#
+#   loopmind prepare-pretrain --config configs/data-500m.toml
+#
+# Each source streams from its first row, so a smaller total_tokens with the same mix takes
+# a prefix of every source. A 50M run on this mix reads the same documents as the start of
+# this one.
+
+seed = 42
+tokenizer = "tokenizer/tokenizer.json"
+output_dir = "data/prepared-500m"
+python = "python3"
+
+[revisions]
+fineweb = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+cosmopedia = "3ba9d605774198c5868892d7a8deda78031a781f"
+tinystories = "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64"
+fable = "d0bcd6b2181f5588afa9e136a383397dff956620"
+minimind = "312afb4f76391145c6902f765bb51691c09a12f5"
+smoltalk = "f73fe857d519ff6ac5af2ea67c4d3834da7b8bcc"
+simplewiki = "b04c8d1ceb2f5cd4588862100d08de323dccfbaa"
+
+[pretrain]
+total_tokens = 500_000_000
+context_length = 1024
+val_ratio = 0.01
+shard_sequences = 512
+
+# FineWeb-Edu: educational web pages, the bulk of the knowledge.
+[[pretrain.mix]]
+source = "fineweb"
+percent = 53
+
+# Cosmopedia v2: synthetic textbooks and explanations, written plainly.
+[[pretrain.mix]]
+source = "cosmopedia"
+percent = 25
+
+# Simple English Wikipedia (CC-BY-SA-3.0 / GFDL): short encyclopedic facts in plain
+# language. 241,787 articles, about 75M tokens in all, so 50M leaves room.
+[[pretrain.mix]]
+source = "simplewiki"
+percent = 10
+
+# TinyStories: simple fluent English, which small models learn early.
+[[pretrain.mix]]
+source = "tinystories"
+percent = 10
+
+# FABLE raw_text_corpus: only 10,000 English rows, about 16M tokens, so it stays small.
+[[pretrain.mix]]
+source = "fable-wiki"
+percent = 2
+
+[sft]
+max_tokens = 1024
+eval_rows = 2000
+exclude_cc_by_sa = false
+minimind_file = "data/raw/minimind/sft_t2t_mini.jsonl"
+smoltalk = true
