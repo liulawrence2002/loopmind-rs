@@ -34,9 +34,9 @@ Each new width costs CubeCL kernel compiles and an autotune pass, so 64 was fast
 | `epochs` | 2 | 19,190 steps |
 | `learning_rate` | 1e-4 | a third of the pretrain peak; cosine floor 1e-5, warmup 100 |
 | `weight_decay` | 0.1 | as pretrain |
-| `val_every` | 500 | masked loss on the first 128 `eval.jsonl` rows (all `math_reasoning`) at r = 1, 2, 4, 8 |
+| `val_every` | 500 | masked loss on `val_rows` (128) `eval.jsonl` rows at r = 1, 2, 4, 8, taken round-robin across the four configs, 32 each |
 | `checkpoint.every` | 500 | keep 3 |
-| `samples` | 4 | greedy answers at r = 4 to the first eval prompts, printed at the end and written to `runs/sft/samples.txt` |
+| `samples` | 4 | greedy answers at r = 4 to eval prompts taken the same way, one per config, printed at the end and written to `runs/sft/samples.txt` |
 
 Validation uses held-out rows: `eval.jsonl` is 2,000 checkable rows that are not in the train shards. The validation loss is the same token-mean masked NLL. It is not an accuracy.
 
@@ -54,7 +54,7 @@ On 2026-11-27, from the final pretrain checkpoint (step 6,000), the run took 3 h
 | 15,000 | 2 | 1.752 | 1.620 | 1.589 | 1.643 |
 | 19,190 | 2 | **1.714** | **1.587** | **1.556** | **1.608** |
 
-Validation masked loss on the first 128 eval rows. The full curve is in `runs/sft/metrics.jsonl`.
+Validation masked loss on the first 128 eval rows, which are all `math_reasoning`. Runs before 2026-11-28 read the first rows of `eval.jsonl`, which is grouped by config. Later runs take them round-robin. The full curve is in `runs/sft/metrics.jsonl`.
 
 - From step 2,000 on, r = 4 is the best of the four. Its lead over r = 1 peaked at 0.20 nats around step 4,500 and ended at 0.16. r = 8 is worse than r = 4 at every point, Training draws `r` from a clamped Poisson with mean 4, so only 5.1% of training rows ran 8 or more passes. The loop dial is tuned after training ([refine.md](refine.md)).
 - The second epoch took r = 4 from 1.696 to 1.556. It was still falling at the end, at about 0.004 per 500 steps, as the cosine schedule neared its 1e-5 floor.

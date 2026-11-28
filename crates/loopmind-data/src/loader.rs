@@ -3,6 +3,7 @@
 //! These loaders stay on plain `u16` ids. `loopmind-model` turns a batch into
 //! Burn tensors so this crate does not depend on Burn.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 
@@ -417,14 +418,16 @@ pub fn epoch_order(n: u32, seed: u64, epoch: u64) -> Vec<u32> {
     permutation(n, mix_epoch(seed, epoch))
 }
 
-/// The first `limit` rows of `eval.jsonl`, in file order. `limit == 0` reads every row.
+/// Rows of `eval.jsonl`. `limit == 0` reads every row, in file order.
+///
+/// Otherwise it takes `limit` rows round-robin across configs, in the order the configs
+/// first appear, and in file order within each config. `eval.jsonl` is grouped by config,
+/// so its first rows are all one config. Round-robin lets a small validation set cover
+/// every config.
 pub fn read_sft_eval(path: &Path, limit: usize) -> Result<Vec<SftEvalRow>, DataError> {
     let text = fs::read_to_string(path)?;
     let mut rows = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        if limit > 0 && rows.len() >= limit {
-            break;
-        }
         let row: SftEvalRow = serde_json::from_str(line)
             .map_err(|error| DataError::new(format!("{}: {error}", path.display())))?;
         if row.tokens.len() != row.loss_mask.len() {
@@ -437,7 +440,25 @@ pub fn read_sft_eval(path: &Path, limit: usize) -> Result<Vec<SftEvalRow>, DataE
         }
         rows.push(row);
     }
-    Ok(rows)
+    if limit == 0 || rows.len() <= limit {
+        return Ok(rows);
+    }
+    let mut configs: Vec<(String, VecDeque<SftEvalRow>)> = Vec::new();
+    for row in rows {
+        match configs.iter_mut().find(|(config, _)| *config == row.config) {
+            Some((_, group)) => group.push_back(row),
+            None => configs.push((row.config.clone(), VecDeque::from([row]))),
+        }
+    }
+    let mut picked = Vec::with_capacity(limit);
+    while picked.len() < limit {
+        for (_, group) in &mut configs {
+            if picked.len() < limit {
+                picked.extend(group.pop_front());
+            }
+        }
+    }
+    Ok(picked)
 }
 
 fn bucket_index(len: usize) -> usize {
@@ -613,5 +634,36 @@ mod tests {
         assert!(batch.tokens.contains(&0));
         let row_end = batch.mask[..64].iter().rposition(|bit| *bit == 1).unwrap();
         assert!(batch.mask[row_end + 1..64].iter().all(|bit| *bit == 0));
+    }
+
+    #[test]
+    fn a_limited_eval_read_takes_configs_round_robin() {
+        let dir = std::env::temp_dir().join(format!("loopmind-eval-read-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eval.jsonl");
+        let lines: Vec<String> = ["a1:math", "a2:math", "a3:math", "b1:logic", "b2:logic", "c1:json"]
+            .iter()
+            .map(|entry| {
+                let (id, config) = entry.split_once(':').unwrap();
+                format!(
+                    r#"{{"id":"{id}","config":"{config}","license":"x","reference":"r","tokens":[1,2],"loss_mask":[0,1]}}"#
+                )
+            })
+            .collect();
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let ids = |limit| -> Vec<String> {
+            read_sft_eval(&path, limit)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect()
+        };
+        assert_eq!(ids(0), ["a1", "a2", "a3", "b1", "b2", "c1"]);
+        assert_eq!(ids(3), ["a1", "b1", "c1"]);
+        assert_eq!(ids(5), ["a1", "b1", "c1", "a2", "b2"]);
+        assert_eq!(ids(6), ["a1", "a2", "a3", "b1", "b2", "c1"]);
+        assert_eq!(ids(9), ["a1", "a2", "a3", "b1", "b2", "c1"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
